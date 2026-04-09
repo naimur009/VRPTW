@@ -1,1097 +1,724 @@
-#!/usr/bin/env python3
-"""
-Safer Gurobi solver for VRPTW on pruned graphs.
-
-Main safety upgrades:
-1. Time-feasible safe-core edge protection
-2. Always preserve depot connectivity
-3. Keep high-probability arcs
-4. Keep top-k feasible arcs by probability and by distance
-5. Adaptive protection for tight time-window customers
-6. Feasibility audit before solve
-7. Safer repair: add feasible fallback arcs first
-8. log_to_console now correctly controls OutputFlag
-
-Usage:
-    python3 solve_pruned_instances_safe.py
-"""
-
 import os
-import sys
-import time
+import json
 import math
-from typing import Dict, List, Tuple, Set
+import time
+import argparse
+from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 import gurobipy as gp
 from gurobipy import GRB
+
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich import box
+from rich.live import Live
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.console import Console, Group
+from rich.rule import Rule
+
+console = Console()
 
 
 # ============================================================
 # Helpers
 # ============================================================
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
 
-def euclidean(p1, p2) -> float:
-    return float(np.hypot(p1[0] - p2[0], p1[1] - p2[1]))
+
+def write_json(path: str, obj: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
 
 
-def get_col(df: pd.DataFrame, candidates: List[str], required: bool = True):
-    for c in candidates:
-        if c in df.columns:
-            return c
+def safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def find_col(df: pd.DataFrame, candidates: List[str], required: bool = True) -> Optional[str]:
+    lower_map = {c.lower().strip(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.lower().strip()
+        if key in lower_map:
+            return lower_map[key]
     if required:
-        raise KeyError(f"Missing required column. Tried: {candidates}")
+        raise ValueError(
+            f"Missing required column. Expected one of {candidates}. Found columns: {list(df.columns)}"
+        )
     return None
 
 
-def build_full_distance_dict(nodes_df: pd.DataFrame) -> Dict[Tuple[int, int], float]:
-    coords = {
-        int(r["node_id"]): (float(r["x"]), float(r["y"]))
-        for _, r in nodes_df.iterrows()
+# ============================================================
+# File discovery
+# ============================================================
+def discover_instances(solver_graph_root: str, instances: Optional[List[str]] = None):
+    found = []
+
+    for inst_name in sorted(os.listdir(solver_graph_root)):
+        inst_dir = os.path.join(solver_graph_root, inst_name)
+
+        if not os.path.isdir(inst_dir):
+            continue
+
+        if instances is not None and len(instances) > 0 and inst_name not in instances:
+            continue
+
+        if not os.path.isfile(os.path.join(inst_dir, "nodes.csv")):
+            continue
+
+        found.append((inst_name, inst_dir))
+
+    return found
+
+
+def find_nodes_file(inst_dir: str) -> str:
+    path = os.path.join(inst_dir, "nodes.csv")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"nodes.csv not found: {path}")
+    return path
+
+
+def find_edges_file(inst_dir: str, pct: int) -> str:
+    path = os.path.join(inst_dir, f"solver_edges_top_{pct}.csv")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"solver_edges_top_{pct}.csv not found: {path}")
+    return path
+
+
+# ============================================================
+# Loading data
+# ============================================================
+def load_nodes(nodes_path: str):
+    df = pd.read_csv(nodes_path)
+
+    node_id_col = find_col(df, ["node_id", "id", "node"])
+    demand_col = find_col(df, ["demand"])
+    ready_col = find_col(df, ["ready_time", "tw_start", "earliest"])
+    due_col = find_col(df, ["due_time", "tw_end", "latest"])
+    service_col = find_col(df, ["service_time", "service", "service_duration"])
+    is_depot_col = find_col(df, ["is_depot", "depot"], required=False)
+    x_col = find_col(df, ["x", "x_coord", "coord_x"], required=False)
+    y_col = find_col(df, ["y", "y_coord", "coord_y"], required=False)
+
+    nodes = {}
+    depot = None
+
+    for _, row in df.iterrows():
+        nid = safe_int(row[node_id_col])
+        demand = safe_float(row[demand_col], 0.0)
+        ready = safe_float(row[ready_col], 0.0)
+        due = safe_float(row[due_col], 0.0)
+        service = safe_float(row[service_col], 0.0)
+
+        if is_depot_col is not None:
+            is_depot = safe_int(row[is_depot_col], 0)
+        else:
+            is_depot = 1 if nid == 0 else 0
+
+        x = safe_float(row[x_col], 0.0) if x_col is not None else None
+        y = safe_float(row[y_col], 0.0) if y_col is not None else None
+
+        nodes[nid] = {
+            "id": nid,
+            "demand": demand,
+            "ready": ready,
+            "due": due,
+            "service": service,
+            "is_depot": is_depot,
+            "x": x,
+            "y": y,
+        }
+
+        if is_depot == 1:
+            depot = nid
+
+    if depot is None:
+        depot = 0 if 0 in nodes else min(nodes.keys())
+
+    node_ids = sorted(nodes.keys())
+    customers = [n for n in node_ids if n != depot]
+
+    return {
+        "nodes": nodes,
+        "node_ids": node_ids,
+        "customers": customers,
+        "depot": depot,
     }
-    V = list(coords.keys())
-    dist = {}
-    for i in V:
-        for j in V:
-            if i != j:
-                dist[(i, j)] = euclidean(coords[i], coords[j])
-    return dist
 
 
-def compute_route_distance(route: List[int], dist: Dict[Tuple[int, int], float]) -> float:
-    total = 0.0
-    for k in range(len(route) - 1):
-        total += dist.get((route[k], route[k + 1]), 0.0)
-    return total
+def euclidean(a: dict, b: dict) -> float:
+    if a["x"] is None or a["y"] is None or b["x"] is None or b["y"] is None:
+        raise ValueError("Cannot compute distance: x/y missing in nodes.csv")
+    return math.hypot(a["x"] - b["x"], a["y"] - b["y"])
 
 
-def extract_routes(used_arcs: List[Tuple[int, int]], depot: int) -> List[List[int]]:
+def load_edges(edges_path: str, nodes: Dict[int, dict]):
+    df = pd.read_csv(edges_path)
+
+    from_col = find_col(df, ["from", "src", "i", "source"])
+    to_col = find_col(df, ["to", "dst", "j", "target"])
+
+    cost_col = find_col(df, ["cost", "distance", "dist"], required=False)
+    travel_col = find_col(df, ["travel_time", "time", "tt"], required=False)
+
+    arcs = {}
+
+    for _, row in df.iterrows():
+        i = safe_int(row[from_col])
+        j = safe_int(row[to_col])
+
+        if i == j:
+            continue
+        if i not in nodes or j not in nodes:
+            continue
+
+        if cost_col is not None:
+            cost = safe_float(row[cost_col], 0.0)
+        else:
+            cost = euclidean(nodes[i], nodes[j])
+
+        if travel_col is not None:
+            travel = safe_float(row[travel_col], cost)
+        else:
+            travel = cost
+
+        arcs[(i, j)] = {
+            "cost": cost,
+            "travel": travel,
+        }
+
+    return arcs
+
+
+def ensure_depot_edges(node_data: dict, arcs: Dict[tuple, dict]):
+    depot = node_data["depot"]
+    customers = node_data["customers"]
+    nodes = node_data["nodes"]
+
+    for c in customers:
+        if (depot, c) not in arcs:
+            dist = euclidean(nodes[depot], nodes[c])
+            arcs[(depot, c)] = {"cost": dist, "travel": dist}
+
+        if (c, depot) not in arcs:
+            dist = euclidean(nodes[c], nodes[depot])
+            arcs[(c, depot)] = {"cost": dist, "travel": dist}
+
+    return arcs
+
+
+def load_instance(inst_dir: str, pct: int, capacity: float):
+    nodes_path = find_nodes_file(inst_dir)
+    edges_path = find_edges_file(inst_dir, pct)
+
+    node_data = load_nodes(nodes_path)
+    arcs = load_edges(edges_path, node_data["nodes"])
+    arcs = ensure_depot_edges(node_data, arcs)
+
+    return {
+        "inst_dir": inst_dir,
+        "pct": pct,
+        "capacity": capacity,
+        "nodes": node_data["nodes"],
+        "node_ids": node_data["node_ids"],
+        "customers": node_data["customers"],
+        "depot": node_data["depot"],
+        "arcs": arcs,
+        "nodes_path": nodes_path,
+        "edges_path": edges_path,
+    }
+
+
+# ============================================================
+# Precheck
+# ============================================================
+def quick_precheck(data: dict, max_vehicles: int):
+    depot = data["depot"]
+    customers = data["customers"]
+    arcs = data["arcs"]
+    nodes = data["nodes"]
+
+    incoming = {c: 0 for c in customers}
+    outgoing = {c: 0 for c in customers}
+    dep_out = 0
+    dep_in = 0
+
+    for (i, j) in arcs.keys():
+        if j in incoming:
+            incoming[j] += 1
+        if i in outgoing:
+            outgoing[i] += 1
+        if i == depot and j != depot:
+            dep_out += 1
+        if i != depot and j == depot:
+            dep_in += 1
+
+    no_in = [c for c in customers if incoming[c] == 0]
+    no_out = [c for c in customers if outgoing[c] == 0]
+
+    if no_in:
+        return False, f"Customers with no incoming edges: {no_in[:10]}"
+    if no_out:
+        return False, f"Customers with no outgoing edges: {no_out[:10]}"
+    if dep_out == 0:
+        return False, "No depot->customer edges"
+    if dep_in == 0:
+        return False, "No customer->depot edges"
+
+    total_demand = sum(nodes[c]["demand"] for c in customers)
+    if total_demand > max_vehicles * data["capacity"]:
+        return False, f"Total demand {total_demand} exceeds max fleet capacity {max_vehicles * data['capacity']}"
+
+    return True, "OK"
+
+
+# ============================================================
+# Build model
+# ============================================================
+def build_model(data: dict, time_limit: int, mip_gap: float, max_vehicles: int, verbose: bool, output_flag: int = 0):
+    depot = data["depot"]
+    customers = data["customers"]
+    node_ids = data["node_ids"]
+    nodes = data["nodes"]
+    arcs = data["arcs"]
+    Q = data["capacity"]
+
+    A = list(arcs.keys())
+
+    model = gp.Model(f"VRPTW_top_{data['pct']}")
+    model.Params.OutputFlag = output_flag
+    model.Params.TimeLimit = time_limit
+    model.Params.MIPGap = mip_gap
+
+    x = model.addVars(A, vtype=GRB.BINARY, name="x")
+    t = model.addVars(node_ids, vtype=GRB.CONTINUOUS, lb=0.0, name="t")
+    u = model.addVars(node_ids, vtype=GRB.CONTINUOUS, lb=0.0, ub=Q, name="u")
+
+    model.setObjective(gp.quicksum(arcs[a]["cost"] * x[a] for a in A), GRB.MINIMIZE)
+
+    for c in customers:
+        in_arcs = [a for a in A if a[1] == c]
+        out_arcs = [a for a in A if a[0] == c]
+        model.addConstr(gp.quicksum(x[a] for a in in_arcs) == 1, name=f"in_{c}")
+        model.addConstr(gp.quicksum(x[a] for a in out_arcs) == 1, name=f"out_{c}")
+
+    dep_out = [a for a in A if a[0] == depot and a[1] != depot]
+    dep_in = [a for a in A if a[1] == depot and a[0] != depot]
+
+    model.addConstr(gp.quicksum(x[a] for a in dep_out) <= max_vehicles, name="max_vehicle_out")
+    model.addConstr(gp.quicksum(x[a] for a in dep_in) <= max_vehicles, name="max_vehicle_in")
+    model.addConstr(gp.quicksum(x[a] for a in dep_out) == gp.quicksum(x[a] for a in dep_in), name="vehicle_balance")
+
+    for i in node_ids:
+        model.addConstr(t[i] >= nodes[i]["ready"], name=f"ready_{i}")
+        model.addConstr(t[i] <= nodes[i]["due"], name=f"due_{i}")
+
+    model.addConstr(t[depot] >= nodes[depot]["ready"], name="depot_ready")
+
+    for (i, j) in A:
+        if j == depot:
+            continue
+
+        M = max(1e5, nodes[i]["due"] + nodes[i]["service"] + arcs[(i, j)]["travel"] - nodes[j]["ready"])
+        model.addConstr(
+            t[j] >= t[i] + nodes[i]["service"] + arcs[(i, j)]["travel"] - M * (1 - x[(i, j)]),
+            name=f"time_{i}_{j}"
+        )
+
+    model.addConstr(u[depot] == 0.0, name="load_depot")
+
+    for c in customers:
+        model.addConstr(u[c] >= nodes[c]["demand"], name=f"load_lb_{c}")
+        model.addConstr(u[c] <= Q, name=f"load_ub_{c}")
+
+    for (i, j) in A:
+        if i == depot and j != depot:
+            model.addConstr(u[j] >= nodes[j]["demand"] * x[(i, j)], name=f"cap_from_depot_{j}")
+        elif i != depot and j != depot:
+            model.addConstr(u[j] >= u[i] + nodes[j]["demand"] - Q * (1 - x[(i, j)]), name=f"cap_{i}_{j}")
+
+    return model, x
+
+
+# ============================================================
+# Extract routes
+# ============================================================
+def extract_solution(model, x, data):
+    if model.SolCount == 0:
+        return None
+
+    depot = data["depot"]
+    selected = [(i, j) for (i, j) in data["arcs"].keys() if x[(i, j)].X > 0.5]
+
     succ = {}
-    depot_starts = []
-
-    for i, j in used_arcs:
-        if i == depot:
-            depot_starts.append(j)
-        succ[i] = j
+    for i, j in selected:
+        succ.setdefault(i, []).append(j)
 
     routes = []
-    for start in depot_starts:
-        route = [depot]
-        cur = start
-        seen = {depot}
+    if depot in succ:
+        for first in succ[depot]:
+            route = [depot, first]
+            cur = first
+            seen = {depot, first}
 
-        while True:
-            route.append(cur)
+            while cur != depot:
+                nxts = succ.get(cur, [])
+                if not nxts:
+                    break
+                nxt = nxts[0]
+                route.append(nxt)
+                if nxt == depot:
+                    break
+                if nxt in seen:
+                    break
+                seen.add(nxt)
+                cur = nxt
 
-            if cur == depot:
-                break
-            if cur in seen:
-                break
-            seen.add(cur)
+            routes.append(route)
 
-            if cur not in succ:
-                break
-
-            cur = succ[cur]
-
-        routes.append(route)
-
-    return routes
-
-
-# ============================================================
-# VRPTW feasibility helpers
-# ============================================================
-
-def is_time_feasible(
-    i: int,
-    j: int,
-    a: Dict[int, float],
-    b: Dict[int, float],
-    s: Dict[int, float],
-    dist: Dict[Tuple[int, int], float]
-) -> bool:
-    """
-    Basic arc time feasibility:
-        earliest possible departure from i + travel <= due time at j
-    """
-    if i == j:
-        return False
-    return a[i] + s[i] + dist[(i, j)] <= b[j]
-
-
-def temporal_slack(
-    i: int,
-    j: int,
-    a: Dict[int, float],
-    b: Dict[int, float],
-    s: Dict[int, float],
-    dist: Dict[Tuple[int, int], float]
-) -> float:
-    return b[j] - (a[i] + s[i] + dist[(i, j)])
-
-
-def compute_window_widths(
-    V: List[int],
-    a: Dict[int, float],
-    b: Dict[int, float]
-) -> Dict[int, float]:
-    return {i: float(b[i] - a[i]) for i in V}
-
-
-def classify_tight_customers(
-    C: List[int],
-    a: Dict[int, float],
-    b: Dict[int, float],
-    tight_quantile: float = 0.25
-) -> Set[int]:
-    widths = np.array([b[i] - a[i] for i in C], dtype=float)
-    if len(widths) == 0:
-        return set()
-    threshold = float(np.quantile(widths, tight_quantile))
-    return {i for i in C if (b[i] - a[i]) <= threshold}
-
-
-# ============================================================
-# Safe-core construction
-# ============================================================
-
-def build_candidate_arc_rows(edges_df: pd.DataFrame) -> Dict[Tuple[int, int], Dict]:
-    rows = {}
-    for _, r in edges_df.iterrows():
-        i, j = int(r["from"]), int(r["to"])
-        if i != j:
-            rows[(i, j)] = dict(r)
-    return rows
-
-
-def build_default_arc_row(
-    i: int,
-    j: int,
-    full_dist: Dict[Tuple[int, int], float],
-    prob_val: float = 0.0,
-    reason: str = "repair_added"
-) -> Dict:
     return {
-        "from": i,
-        "to": j,
-        "distance": full_dist[(i, j)],
-        "prob": prob_val,
-        "keep_for_solver": 1,
-        "added_by_repair": 1,
-        "kept_reason": reason,
+        "objective": float(model.ObjVal),
+        "num_routes": len(routes),
+        "selected_edges": selected,
+        "routes": routes,
     }
 
 
-def protected_safe_core_edges(
-    nodes_df: pd.DataFrame,
-    edges_df: pd.DataFrame,
-    depot: int,
-    a: Dict[int, float],
-    b: Dict[int, float],
-    s: Dict[int, float],
-    full_dist: Dict[Tuple[int, int], float],
-    strong_keep_prob: float = 0.70,
-    soft_keep_prob: float = 0.35,
-    top_k_prob: int = 3,
-    top_k_dist: int = 3,
-    tight_extra_k: int = 2,
-) -> Set[Tuple[int, int]]:
-    """
-    Build a 'safe core' of protected arcs.
-
-    Keep an arc if any of:
-    - depot related
-    - high probability
-    - in top-k feasible outgoing/incoming by probability
-    - in top-k feasible outgoing/incoming by distance
-    - extra protection for tight-window customers
-    """
-    V = [int(v) for v in nodes_df["node_id"].tolist()]
-    C = [v for v in V if v != depot]
-    tight_customers = classify_tight_customers(C, a, b)
-
-    # Use candidate arcs from scored/pruned graph if present
-    arc_rows = build_candidate_arc_rows(edges_df)
-    candidate_arcs = set(arc_rows.keys())
-
-    protected = set()
-
-    # Always keep depot connectivity in both directions
-    for c in C:
-        protected.add((depot, c))
-        protected.add((c, depot))
-
-    # Evaluate feasible candidate arcs
-    feasible_arcs = []
-    for i, j in candidate_arcs:
-        if is_time_feasible(i, j, a, b, s, full_dist):
-            feasible_arcs.append((i, j))
-
-    # High-probability arcs
-    for i, j in feasible_arcs:
-        p = float(arc_rows[(i, j)].get("prob", 0.0))
-        if p >= strong_keep_prob:
-            protected.add((i, j))
-
-    # Per node protection
-    for i in C:
-        extra = tight_extra_k if i in tight_customers else 0
-        k_prob_i = top_k_prob + extra
-        k_dist_i = top_k_dist + extra
-
-        # Feasible outgoing from i
-        feasible_out = [(ii, j) for (ii, j) in feasible_arcs if ii == i]
-        feasible_in = [(j, ii) for (j, ii) in feasible_arcs if ii == i]
-
-        # Top-k by probability
-        feasible_out_by_prob = sorted(
-            feasible_out,
-            key=lambda arc: (
-                float(arc_rows[arc].get("prob", 0.0)),
-                -full_dist[(arc[0], arc[1])]
-            ),
-            reverse=True
-        )
-        feasible_in_by_prob = sorted(
-            feasible_in,
-            key=lambda arc: (
-                float(arc_rows[arc].get("prob", 0.0)),
-                -full_dist[(arc[0], arc[1])]
-            ),
-            reverse=True
-        )
-
-        # Top-k by distance
-        feasible_out_by_dist = sorted(
-            feasible_out,
-            key=lambda arc: (
-                full_dist[(arc[0], arc[1])],
-                -float(arc_rows[arc].get("prob", 0.0))
-            )
-        )
-        feasible_in_by_dist = sorted(
-            feasible_in,
-            key=lambda arc: (
-                full_dist[(arc[0], arc[1])],
-                -float(arc_rows[arc].get("prob", 0.0))
-            )
-        )
-
-        for arc in feasible_out_by_prob[:k_prob_i]:
-            protected.add(arc)
-        for arc in feasible_in_by_prob[:k_prob_i]:
-            protected.add(arc)
-        for arc in feasible_out_by_dist[:k_dist_i]:
-            protected.add(arc)
-        for arc in feasible_in_by_dist[:k_dist_i]:
-            protected.add(arc)
-
-        # Soft threshold: keep moderate-prob feasible arcs if tight-window node
-        if i in tight_customers:
-            for arc in feasible_out:
-                if float(arc_rows[arc].get("prob", 0.0)) >= soft_keep_prob:
-                    protected.add(arc)
-            for arc in feasible_in:
-                if float(arc_rows[arc].get("prob", 0.0)) >= soft_keep_prob:
-                    protected.add(arc)
-
-    return protected
-
-
 # ============================================================
-# Feasibility audit
+# Dynamic solver
 # ============================================================
-
-def audit_graph_feasibility(
-    V: List[int],
-    C: List[int],
-    depot: int,
-    arcs: Set[Tuple[int, int]],
-    a: Dict[int, float],
-    b: Dict[int, float],
-    s: Dict[int, float],
-    dist: Dict[Tuple[int, int], float]
-) -> Dict:
-    report = {
-        "ok": True,
-        "missing_out": [],
-        "missing_in": [],
-        "missing_from_depot": [],
-        "missing_to_depot": [],
-    }
-
-    def feasible_out(i):
-        return [j for (ii, j) in arcs if ii == i and is_time_feasible(ii, j, a, b, s, dist)]
-
-    def feasible_in(i):
-        return [j for (j, ii) in arcs if ii == i and is_time_feasible(j, ii, a, b, s, dist)]
-
-    for i in C:
-        if len(feasible_out(i)) == 0:
-            report["ok"] = False
-            report["missing_out"].append(i)
-        if len(feasible_in(i)) == 0:
-            report["ok"] = False
-            report["missing_in"].append(i)
-        if (depot, i) not in arcs or not is_time_feasible(depot, i, a, b, s, dist):
-            report["ok"] = False
-            report["missing_from_depot"].append(i)
-        if (i, depot) not in arcs or not is_time_feasible(i, depot, a, b, s, dist):
-            report["ok"] = False
-            report["missing_to_depot"].append(i)
-
-    return report
-
-
-# ============================================================
-# Safe graph repair
-# ============================================================
-
-def repair_pruned_graph_safer(
-    nodes_df: pd.DataFrame,
-    edges_df: pd.DataFrame,
-    depot: int,
-    a: Dict[int, float],
-    b: Dict[int, float],
-    s: Dict[int, float],
-    strong_keep_prob: float = 0.70,
-    soft_keep_prob: float = 0.35,
-    top_k_prob: int = 3,
-    top_k_dist: int = 3,
-    min_degree: int = 3,
-    knn_repair_k: int = 4,
-    tight_extra_k: int = 2,
-) -> pd.DataFrame:
-    """
-    Safer repair strategy:
-    1. Start from existing keep_for_solver edges if present
-    2. Build protected safe-core edges
-    3. Keep only time-feasible protected/candidate edges
-    4. Ensure depot links
-    5. Ensure min feasible in/out degree
-    6. Repair using feasible high-score and feasible nearest neighbors
-    """
-    edges_df = edges_df.copy()
-    if "keep_for_solver" in edges_df.columns:
-        base_df = edges_df[edges_df["keep_for_solver"] == 1].copy()
-    else:
-        base_df = edges_df.copy()
-
-    base_df = base_df[base_df["from"] != base_df["to"]].copy()
-
-    V = [int(v) for v in nodes_df["node_id"].tolist()]
-    C = [v for v in V if v != depot]
-    full_dist = build_full_distance_dict(nodes_df)
-    tight_customers = classify_tight_customers(C, a, b)
-
-    # Candidate rows from original scored graph, not only filtered graph
-    original_arc_rows = build_candidate_arc_rows(edges_df)
-    base_arc_rows = build_candidate_arc_rows(base_df)
-
-    # Protected safe-core from original scored graph
-    protected = protected_safe_core_edges(
-        nodes_df=nodes_df,
-        edges_df=edges_df,
-        depot=depot,
-        a=a,
-        b=b,
-        s=s,
-        full_dist=full_dist,
-        strong_keep_prob=strong_keep_prob,
-        soft_keep_prob=soft_keep_prob,
-        top_k_prob=top_k_prob,
-        top_k_dist=top_k_dist,
-        tight_extra_k=tight_extra_k,
-    )
-
-    # Start with time-feasible base arcs
-    existing_rows = {}
-    for (i, j), row in base_arc_rows.items():
-        if is_time_feasible(i, j, a, b, s, full_dist):
-            row = dict(row)
-            row["distance"] = float(row.get("distance", full_dist[(i, j)]))
-            row["keep_for_solver"] = 1
-            row["added_by_repair"] = int(row.get("added_by_repair", 0))
-            row["kept_reason"] = row.get("kept_reason", "base_time_feasible")
-            existing_rows[(i, j)] = row
-
-    existing = set(existing_rows.keys())
-
-    def add_arc(i: int, j: int, reason: str = "repair_added", prob_val: float = None):
-        if i == j:
-            return
-        if (i, j) in existing:
-            return
-        if not is_time_feasible(i, j, a, b, s, full_dist):
-            return
-
-        if prob_val is None:
-            if (i, j) in original_arc_rows:
-                prob_val = float(original_arc_rows[(i, j)].get("prob", 0.0))
-            else:
-                prob_val = 0.0
-
-        existing_rows[(i, j)] = build_default_arc_row(
-            i=i,
-            j=j,
-            full_dist=full_dist,
-            prob_val=prob_val,
-            reason=reason,
-        )
-        existing.add((i, j))
-
-    # Add protected safe-core arcs
-    for i, j in protected:
-        add_arc(i, j, reason="safe_core")
-
-    # Always ensure depot arcs if time-feasible
-    for c in C:
-        add_arc(depot, c, reason="depot_connectivity")
-        add_arc(c, depot, reason="depot_connectivity")
-
-    def out_neighbors(i: int) -> List[int]:
-        return [j for (ii, j) in existing if ii == i]
-
-    def in_neighbors(i: int) -> List[int]:
-        return [j for (j, ii) in existing if ii == i]
-
-    def feasible_out_candidates(i: int) -> List[int]:
-        return [j for j in V if j != i and is_time_feasible(i, j, a, b, s, full_dist)]
-
-    def feasible_in_candidates(i: int) -> List[int]:
-        return [j for j in V if j != i and is_time_feasible(j, i, a, b, s, full_dist)]
-
-    def get_prob(i: int, j: int) -> float:
-        if (i, j) in original_arc_rows:
-            return float(original_arc_rows[(i, j)].get("prob", 0.0))
-        return 0.0
-
-    # Adaptive degree protection
-    for i in C:
-        extra = tight_extra_k if i in tight_customers else 0
-        target_out = max(min_degree + extra, knn_repair_k)
-        target_in = max(min_degree + extra, knn_repair_k)
-
-        current_out = set(out_neighbors(i))
-        current_in = set(in_neighbors(i))
-
-        # Feasible outgoing candidates not yet kept
-        out_cands = [j for j in feasible_out_candidates(i) if j not in current_out]
-        in_cands = [j for j in feasible_in_candidates(i) if j not in current_in]
-
-        # First prefer high-probability feasible arcs
-        out_by_prob = sorted(
-            out_cands,
-            key=lambda j: (get_prob(i, j), -full_dist[(i, j)]),
-            reverse=True
-        )
-        in_by_prob = sorted(
-            in_cands,
-            key=lambda j: (get_prob(j, i), -full_dist[(j, i)]),
-            reverse=True
-        )
-
-        # Then prefer near feasible arcs
-        out_by_dist = sorted(
-            out_cands,
-            key=lambda j: (full_dist[(i, j)], -get_prob(i, j))
-        )
-        in_by_dist = sorted(
-            in_cands,
-            key=lambda j: (full_dist[(j, i)], -get_prob(j, i))
-        )
-
-        need_out = max(0, target_out - len(current_out))
-        need_in = max(0, target_in - len(current_in))
-
-        used_j = set()
-        for j in out_by_prob:
-            if need_out <= 0:
-                break
-            if j in used_j:
-                continue
-            add_arc(i, j, reason="repair_prob_out")
-            used_j.add(j)
-            need_out -= 1
-
-        for j in out_by_dist:
-            if need_out <= 0:
-                break
-            if j in used_j:
-                continue
-            add_arc(i, j, reason="repair_dist_out")
-            used_j.add(j)
-            need_out -= 1
-
-        used_j = set()
-        for j in in_by_prob:
-            if need_in <= 0:
-                break
-            if j in used_j:
-                continue
-            add_arc(j, i, reason="repair_prob_in")
-            used_j.add(j)
-            need_in -= 1
-
-        for j in in_by_dist:
-            if need_in <= 0:
-                break
-            if j in used_j:
-                continue
-            add_arc(j, i, reason="repair_dist_in")
-            used_j.add(j)
-            need_in -= 1
-
-    repaired_df = pd.DataFrame(list(existing_rows.values()))
-    repaired_df = repaired_df.drop_duplicates(subset=["from", "to"]).reset_index(drop=True)
-
-    if "distance" not in repaired_df.columns:
-        repaired_df["distance"] = repaired_df.apply(
-            lambda r: full_dist[(int(r["from"]), int(r["to"]))], axis=1
-        )
-    if "prob" not in repaired_df.columns:
-        repaired_df["prob"] = 0.0
-    if "keep_for_solver" not in repaired_df.columns:
-        repaired_df["keep_for_solver"] = 1
-    if "added_by_repair" not in repaired_df.columns:
-        repaired_df["added_by_repair"] = 0
-    if "kept_reason" not in repaired_df.columns:
-        repaired_df["kept_reason"] = "unknown"
-
-    return repaired_df
-
-
-# ============================================================
-# Warm start heuristic
-# ============================================================
-
-def build_greedy_warm_start(
-    V: List[int],
-    C: List[int],
-    depot: int,
-    arcs: Set[Tuple[int, int]],
-    demand: Dict[int, float],
-    a: Dict[int, float],
-    b: Dict[int, float],
-    s: Dict[int, float],
-    dist: Dict[Tuple[int, int], float],
-    prob: Dict[Tuple[int, int], float],
-    vehicle_capacity: float,
-    max_vehicles: int
-) -> List[Tuple[int, int]]:
-    """
-    Construct a simple feasible-ish greedy warm start.
-    It may not always cover all customers, but often helps more than threshold starts.
-    """
-    unserved = set(C)
-    used_arcs = []
-
-    vehicles_used = 0
-    while unserved and vehicles_used < max_vehicles:
-        cur = depot
-        cur_time = max(0.0, a[depot])
-        cur_load = 0.0
-        route = []
-
-        while True:
-            candidates = []
-            for j in list(unserved):
-                if (cur, j) not in arcs:
-                    continue
-                if cur_load + demand[j] > vehicle_capacity:
-                    continue
-
-                arrival = cur_time + (s[cur] if cur != depot else 0.0) + dist[(cur, j)]
-                start_service = max(arrival, a[j])
-                if start_service > b[j]:
-                    continue
-
-                back_ok = (j, depot) in arcs and is_time_feasible(j, depot, a, b, s, dist)
-                if not back_ok:
-                    continue
-
-                slack = temporal_slack(cur, j, a, b, s, dist)
-                score = (
-                    10.0 * prob.get((cur, j), 0.0)
-                    - 0.01 * dist[(cur, j)]
-                    - 0.001 * max(0.0, -slack)
-                )
-                candidates.append((score, j, start_service))
-
-            if not candidates:
-                break
-
-            candidates.sort(reverse=True)
-            _, nxt, start_service = candidates[0]
-
-            route.append((cur, nxt))
-            unserved.remove(nxt)
-            cur_load += demand[nxt]
-            cur_time = start_service
-            cur = nxt
-
-        if cur != depot and (cur, depot) in arcs:
-            route.append((cur, depot))
-
-        if not route:
-            break
-
-        used_arcs.extend(route)
-        vehicles_used += 1
-
-    return used_arcs
-
-
-# ============================================================
-# Solver
-# ============================================================
-
-def solve_vrptw_pruned(
-    instance_path: str,
-    vehicle_capacity: float = 200.0,
-    max_vehicles: int = 30,
-    time_limit: int = 300,
-    threads: int = 0,
-    mip_gap: float = 0.01,
-    lambda_prob: float = 0.05,
-    warm_start_prob: float = 0.85,
-    strong_keep_prob: float = 0.70,
-    soft_keep_prob: float = 0.35,
-    top_k_prob: int = 3,
-    top_k_dist: int = 3,
-    knn_repair_k: int = 4,
-    min_degree: int = 3,
-    tight_extra_k: int = 2,
-    mip_focus: int = 1,
-    numeric_focus: int = 1,
-    log_to_console: bool = False,
-) -> Dict:
-    instance_name = os.path.basename(instance_path)
-    print(f"\n{'=' * 80}")
-    print(f"Solving: {instance_name}")
-    print(f"{'=' * 80}")
-
-    try:
-        nodes_csv = os.path.join(instance_path, f"{instance_name}_nodes.csv")
-        edges_csv = os.path.join(instance_path, f"{instance_name}_edges_solver.csv")
-
-        if not os.path.exists(nodes_csv):
-            raise FileNotFoundError(f"Missing nodes file: {nodes_csv}")
-        if not os.path.exists(edges_csv):
-            raise FileNotFoundError(f"Missing edges file: {edges_csv}")
-
-        nodes_df = pd.read_csv(nodes_csv)
-        edges_df = pd.read_csv(edges_csv)
-
-        # Column mapping
-        node_id_col = get_col(nodes_df, ["node_id"])
-        depot_col = get_col(nodes_df, ["is_depot"])
-        x_col = get_col(nodes_df, ["x"])
-        y_col = get_col(nodes_df, ["y"])
-        demand_col = get_col(nodes_df, ["demand", "DEMAND"])
-        ready_col = get_col(nodes_df, ["ready_time", "READY TIME"])
-        due_col = get_col(nodes_df, ["due_date", "DUE DATE"])
-        service_col = get_col(nodes_df, ["service_time", "SERVICE TIME"])
-
-        depot_rows = nodes_df[nodes_df[depot_col] == 1]
-        if len(depot_rows) != 1:
-            raise ValueError(f"Expected exactly one depot, found {len(depot_rows)}")
-
-        depot = int(depot_rows.iloc[0][node_id_col])
-        V = [int(v) for v in nodes_df[node_id_col].tolist()]
-        C = [v for v in V if v != depot]
-
-        nodes_indexed = nodes_df.set_index(node_id_col)
-        demand = {int(k): float(v) for k, v in nodes_indexed[demand_col].to_dict().items()}
-        a = {int(k): float(v) for k, v in nodes_indexed[ready_col].to_dict().items()}
-        b = {int(k): float(v) for k, v in nodes_indexed[due_col].to_dict().items()}
-        s = {int(k): float(v) for k, v in nodes_indexed[service_col].to_dict().items()}
-
-        coords = {
-            int(r[node_id_col]): (float(r[x_col]), float(r[y_col]))
-            for _, r in nodes_df.iterrows()
-        }
-
-        full_dist = build_full_distance_dict(nodes_df)
-
-        # Safer repair
-        repaired_edges_df = repair_pruned_graph_safer(
-            nodes_df=nodes_df,
-            edges_df=edges_df,
-            depot=depot,
-            a=a,
-            b=b,
-            s=s,
-            strong_keep_prob=strong_keep_prob,
-            soft_keep_prob=soft_keep_prob,
-            top_k_prob=top_k_prob,
-            top_k_dist=top_k_dist,
-            min_degree=min_degree,
-            knn_repair_k=knn_repair_k,
-            tight_extra_k=tight_extra_k,
-        )
-
-        repaired_path = os.path.join(instance_path, f"{instance_name}_edges_repaired_safe.csv")
-        repaired_edges_df.to_csv(repaired_path, index=False)
-
-        # Arc set
-        A = []
-        dist = {}
-        prob = {}
-
-        for _, r in repaired_edges_df.iterrows():
-            i, j = int(r["from"]), int(r["to"])
-            if i == j:
-                continue
-
-            # Final time-feasibility filter before model
-            if not is_time_feasible(i, j, a, b, s, full_dist):
-                continue
-
-            A.append((i, j))
-            dist[(i, j)] = float(r["distance"]) if "distance" in repaired_edges_df.columns else full_dist[(i, j)]
-            prob[(i, j)] = float(r["prob"]) if "prob" in repaired_edges_df.columns and pd.notna(r["prob"]) else 0.0
-
-        A = list(dict.fromkeys(A))
-        A_set = set(A)
-
-        # Feasibility audit
-        audit = audit_graph_feasibility(
-            V=V,
-            C=C,
-            depot=depot,
-            arcs=A_set,
-            a=a,
-            b=b,
-            s=s,
-            dist=dist
-        )
-
-        if not audit["ok"]:
-            print("WARNING: Feasibility audit found issues.")
-            print(" missing_out      :", audit["missing_out"][:10])
-            print(" missing_in       :", audit["missing_in"][:10])
-            print(" missing_from_dep :", audit["missing_from_depot"][:10])
-            print(" missing_to_dep   :", audit["missing_to_depot"][:10])
-
-        print(f"Nodes: {len(V)} | Customers: {len(C)} | Arcs after safe repair: {len(A)}")
-
-        # Build model
-        m = gp.Model(instance_name)
-
-        x = m.addVars(A, vtype=GRB.BINARY, name="x")
-        t = m.addVars(V, lb=0.0, vtype=GRB.CONTINUOUS, name="t")
-        u = m.addVars(V, lb=0.0, vtype=GRB.CONTINUOUS, name="u")
-
-        # Mild objective shaping
-        m.setObjective(
-            gp.quicksum(
-                (dist[i, j] - lambda_prob * prob.get((i, j), 0.0)) * x[i, j]
-                for (i, j) in A
-            ),
-            GRB.MINIMIZE
-        )
-
-        # Time windows
-        for i in V:
-            m.addConstr(t[i] >= a[i], name=f"tw_lb_{i}")
-            m.addConstr(t[i] <= b[i], name=f"tw_ub_{i}")
-
-        # Load bounds
-        m.addConstr(u[depot] == 0.0, name="load_depot")
-        for i in C:
-            m.addConstr(u[i] >= demand[i], name=f"load_lb_{i}")
-            m.addConstr(u[i] <= vehicle_capacity, name=f"load_ub_{i}")
-
-        outgoing = {i: [] for i in V}
-        incoming = {i: [] for i in V}
-        for i, j in A:
-            outgoing[i].append((i, j))
-            incoming[j].append((i, j))
-
-        # Visit each customer exactly once
-        for i in C:
-            if len(outgoing[i]) == 0:
-                raise ValueError(f"Customer {i} has no outgoing arcs after safe repair")
-            if len(incoming[i]) == 0:
-                raise ValueError(f"Customer {i} has no incoming arcs after safe repair")
-
-            m.addConstr(
-                gp.quicksum(x[arc] for arc in outgoing[i]) == 1,
-                name=f"out_{i}"
-            )
-            m.addConstr(
-                gp.quicksum(x[arc] for arc in incoming[i]) == 1,
-                name=f"in_{i}"
-            )
-
-        # Depot balance + vehicle bounds
-        if len(outgoing[depot]) == 0 or len(incoming[depot]) == 0:
-            raise ValueError("Depot has no incoming/outgoing arcs after safe repair")
-
-        dep_out = gp.quicksum(x[arc] for arc in outgoing[depot])
-        dep_in = gp.quicksum(x[arc] for arc in incoming[depot])
-
-        m.addConstr(dep_out == dep_in, name="depot_balance")
-        m.addConstr(dep_out <= max_vehicles, name="vehicle_limit")
-
-        min_vehicles = math.ceil(sum(demand[i] for i in C) / vehicle_capacity)
-        m.addConstr(dep_out >= min_vehicles, name="vehicle_lb")
-
-        # Time precedence
-        for (i, j) in A:
-            if j == depot:
-                continue
-            M_ij = max(0.0, b[i] + s[i] + dist[i, j] - a[j])
-            m.addConstr(
-                t[j] >= t[i] + s[i] + dist[i, j] - M_ij * (1 - x[i, j]),
-                name=f"time_{i}_{j}"
-            )
-
-        # Capacity propagation
-        for (i, j) in A:
-            if i != depot and j != depot:
-                m.addConstr(
-                    u[j] >= u[i] + demand[j] - vehicle_capacity * (1 - x[i, j]),
-                    name=f"cap_{i}_{j}"
-                )
-
-        # Branch priorities
-        for (i, j) in A:
-            p = max(0.0, min(1.0, prob.get((i, j), 0.0)))
-            x[i, j].BranchPriority = int(round(100 * p))
-
-        # Greedy warm start
-        warm_arcs = build_greedy_warm_start(
-            V=V,
-            C=C,
-            depot=depot,
-            arcs=A_set,
-            demand=demand,
-            a=a,
-            b=b,
-            s=s,
-            dist=dist,
-            prob=prob,
-            vehicle_capacity=vehicle_capacity,
-            max_vehicles=max_vehicles,
-        )
-        warm_arc_set = set(warm_arcs)
-
-        for (i, j) in A:
-            if (i, j) in warm_arc_set:
-                x[i, j].Start = 1.0
-            elif prob.get((i, j), 0.0) >= warm_start_prob:
-                x[i, j].Start = 1.0
-            else:
-                x[i, j].Start = 0.0
-
-        # Gurobi params
-        m.setParam(GRB.Param.TimeLimit, time_limit)
-        m.setParam(GRB.Param.Threads, threads)
-        m.setParam(GRB.Param.MIPGap, mip_gap)
-        m.setParam(GRB.Param.OutputFlag, 1 if log_to_console else 0)
-        m.setParam(GRB.Param.MIPFocus, mip_focus)
-        m.setParam(GRB.Param.NumericFocus, numeric_focus)
-        m.setParam(GRB.Param.Presolve, 2)
-        m.setParam(GRB.Param.Cuts, 2)
-        m.setParam(GRB.Param.Heuristics, 0.2)
-        m.setParam(GRB.Param.Symmetry, 2)
-
-        m.optimize()
-
-        result = {
-            "instance": instance_name,
-            "status": int(m.Status),
-            "found": False,
-            "objective": None,
-            "best_bound": None,
-            "gap": None,
-            "routes": [],
-            "num_routes": 0,
-            "time": float(m.Runtime),
-            "arcs": len(A),
-            "customers": len(C),
-        }
-
-        if m.Status == GRB.INFEASIBLE:
-            print("Status: INFEASIBLE")
-            try:
-                iis_path = os.path.join(instance_path, f"{instance_name}_iis.ilp")
-                m.computeIIS()
-                m.write(iis_path)
-                result["iis_file"] = iis_path
-                print(f"IIS written to: {iis_path}")
-            except Exception as e:
-                print(f"Could not write IIS: {e}")
-            return result
-
-        if m.SolCount > 0 and m.Status in [GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL]:
-            result["found"] = True
-            result["objective"] = float(m.ObjVal)
-            try:
-                result["best_bound"] = float(m.ObjBound)
-            except Exception:
-                pass
-            try:
-                result["gap"] = float(m.MIPGap)
-            except Exception:
-                pass
-
-            used_arcs = [(i, j) for (i, j) in A if x[i, j].X > 0.5]
-
-            routes = extract_routes(used_arcs, depot)
-            result["routes"] = routes
-            result["num_routes"] = len(routes)
-
-            # Save used arcs
-            sol_edges_rows = []
-            for i, j in used_arcs:
-                sol_edges_rows.append({
-                    "from": i,
-                    "to": j,
-                    "distance": dist[(i, j)],
-                    "prob": prob.get((i, j), 0.0),
+def solve_instance_dynamic(
+    inst_dir: str,
+    subsets_to_try: List[int],
+    capacity: float,
+    time_limit: int,
+    mip_gap: float,
+    max_vehicles: int,
+    verbose: bool = False,
+    stop_on_feasible: bool = True,
+    update_fn=None,
+    output_flag: int = 0,
+):
+    history = []
+
+    for pct in subsets_to_try:
+        t0 = time.time()
+        
+        if update_fn:
+            update_fn(f"Testing [bold cyan]{pct}%[/bold cyan] edge subset...")
+
+        try:
+            data = load_instance(inst_dir=inst_dir, pct=pct, capacity=capacity)
+            ok, msg = quick_precheck(data, max_vehicles=max_vehicles)
+
+            if not ok:
+                if update_fn:
+                    update_fn(f"[yellow]Skipped {pct}% (Precheck)[/yellow]")
+                history.append({
+                    "pct": pct,
+                    "status": "SKIPPED_PRECHECK",
+                    "message": msg,
+                    "runtime_sec": round(time.time() - t0, 4),
                 })
-            sol_edges_df = pd.DataFrame(sol_edges_rows)
-            sol_edges_path = os.path.join(instance_path, f"{instance_name}_solution_edges.csv")
-            sol_edges_df.to_csv(sol_edges_path, index=False)
+                continue
 
-            # Save route summary
-            route_rows = []
-            for ridx, route in enumerate(routes, 1):
-                route_rows.append({
-                    "route_id": ridx,
-                    "route": " -> ".join(map(str, route)),
-                    "num_nodes": len(route),
-                    "distance": compute_route_distance(route, dist),
-                })
-            routes_df = pd.DataFrame(route_rows)
-            routes_path = os.path.join(instance_path, f"{instance_name}_routes.csv")
-            routes_df.to_csv(routes_path, index=False)
+            model, x = build_model(
+                data=data,
+                time_limit=time_limit,
+                mip_gap=mip_gap,
+                max_vehicles=max_vehicles,
+                verbose=verbose,
+                output_flag=output_flag,
+            )
+            
+            def gurobi_callback(model, where):
+                if where == GRB.Callback.MIP:
+                    objbst = model.cbGet(GRB.Callback.MIP_OBJBST)
+                    objbnd = model.cbGet(GRB.Callback.MIP_OBJBND)
+                    
+                    gap = 0.0
+                    if abs(objbst) > 1e-10:
+                        gap = abs(objbst - objbnd) / abs(objbst)
+                    
+                    if update_fn and objbst < 1e30:
+                        update_fn(f"Optimizing [bold cyan]{pct}%[/bold cyan] (Gap: [bold yellow]{gap*100:.2f}%[/bold yellow], Obj: [bold green]{objbst:.2f}[/bold green])")
 
-            status_name = {
+            if update_fn:
+                update_fn(f"Optimizing [bold cyan]{pct}%[/bold cyan]...")
+
+            model.optimize(gurobi_callback)
+
+            status_map = {
                 GRB.OPTIMAL: "OPTIMAL",
+                GRB.INFEASIBLE: "INFEASIBLE",
                 GRB.TIME_LIMIT: "TIME_LIMIT",
                 GRB.SUBOPTIMAL: "SUBOPTIMAL",
-            }.get(m.Status, str(m.Status))
+                GRB.INF_OR_UNBD: "INF_OR_UNBD",
+                GRB.UNBOUNDED: "UNBOUNDED",
+                GRB.INTERRUPTED: "INTERRUPTED",
+            }
+            status_name = status_map.get(model.Status, str(model.Status))
 
-            print(f"Objective: {result['objective']}")
-            print(f"Routes: {result['num_routes']}")
-            for ridx, route in enumerate(routes, 1):
-                print(f"Route {ridx}: {' -> '.join(map(str, route))}")
+            rec = {
+                "pct": pct,
+                "status": status_name,
+                "runtime_sec": round(time.time() - t0, 4),
+                "sol_count": int(model.SolCount),
+                "nodes_file": data["nodes_path"],
+                "edges_file": data["edges_path"],
+                "num_nodes": len(data["node_ids"]),
+                "num_edges": len(data["arcs"]),
+                "gap": model.MIPGap if model.SolCount > 0 else None,
+            }
 
-            return result
+            if model.SolCount > 0:
+                rec["objective"] = float(model.ObjVal)
+                sol = extract_solution(model, x, data)
+                rec["solution"] = sol
+                rec["num_routes"] = sol["num_routes"] if sol else 0
 
-        print("Status: NO_SOLUTION")
-        return result
+            history.append(rec)
 
-    except Exception as e:
-        print(f"ERROR: {str(e)}")
-        return {
-            "instance": instance_name,
-            "status": -1,
-            "found": False,
-            "error": str(e),
-        }
+            if stop_on_feasible and model.SolCount > 0:
+                return {
+                    "success": True,
+                    "chosen_pct": pct,
+                    "history": history,
+                    "final": rec,
+                }
+
+        except Exception as e:
+            history.append({
+                "pct": pct,
+                "status": "ERROR",
+                "error": str(e),
+                "runtime_sec": round(time.time() - t0, 4),
+            })
+
+    if verbose and history:
+        table = Table(title=f"Subset attempts for {os.path.basename(inst_dir)}", box=box.SIMPLE_HEAD)
+        table.add_column("Pct", justify="right")
+        table.add_column("Status")
+        table.add_column("Time (s)", justify="right")
+        table.add_column("Sols", justify="right")
+        table.add_column("Vehicles", justify="right", style="yellow")
+        table.add_column("Objective", justify="right")
+
+        for h in history:
+            color = "green" if h.get("sol_count", 0) > 0 else "red"
+            status = h.get("status", "UNKNOWN")
+            if status == "SKIPPED_PRECHECK":
+                color = "yellow"
+            
+            table.add_row(
+                str(h["pct"]),
+                f"[{color}]{status}[/{color}]",
+                f"{h['runtime_sec']:.2f}",
+                str(h.get("sol_count", 0)),
+                str(h.get("num_routes", "-")),
+                f"{h.get('objective', 0.0):.2f}" if "objective" in h else "-"
+            )
+        console.print(table)
+
+    last = history[-1] if history else None
+    success = any(h.get("sol_count", 0) > 0 for h in history)
+
+    return {
+        "success": success,
+        "chosen_pct": next((h["pct"] for h in history if h.get("sol_count", 0) > 0), None),
+        "history": history,
+        "final": last,
+    }
 
 
 # ============================================================
-# Run all instances
+# Main
 # ============================================================
-
 def main():
-    base_path = os.path.join(os.path.dirname(__file__), "safe_pruned_graphs")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    if not os.path.exists(base_path):
-        print(f"ERROR: {base_path} not found")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Simple dynamic Gurobi solver")
+    parser.add_argument("--solver_graph_root", type=str, default=os.path.join(script_dir, "solver_graph"))
+    parser.add_argument("--output_root", type=str, default=os.path.join(script_dir, "solver_output"))
+    parser.add_argument("--capacity", type=float, default=200.0)
+    parser.add_argument("--time_limit", type=int, default=300)
+    parser.add_argument("--mip_gap", type=float, default=0.01)
+    parser.add_argument("--max_vehicles", type=int, default=30)
+    parser.add_argument("--subsets", type=int, nargs="+", default=[15, 20, 25, 30, 40, 50])
+    parser.add_argument("--instances", nargs="*", default=None)
+    parser.add_argument("--stop_on_feasible", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--gurobi_verbose", action="store_true", help="Enable verbose Gurobi output")
+    args = parser.parse_args()
 
-    instances = sorted(
-        d for d in os.listdir(base_path)
-        if os.path.isdir(os.path.join(base_path, d)) and d.startswith("inst_")
-    )
+    output_flag = 1 if args.gurobi_verbose else 0
+    ensure_dir(args.output_root)
 
-    if not instances:
-        print(f"ERROR: No instances found in {base_path}")
-        sys.exit(1)
-
-    print(f"\n{'=' * 80}")
-    print(f"SOLVING {len(instances)} INSTANCES")
-    print(f"{'=' * 80}")
-
-    start_all = time.time()
-    results = []
-
-    for idx, inst_name in enumerate(instances, 1):
-        print(f"\n[{idx}/{len(instances)}] {inst_name}")
-        instance_path = os.path.join(base_path, inst_name)
-
-        result = solve_vrptw_pruned(
-            instance_path=instance_path,
-            vehicle_capacity=200.0,
-            max_vehicles=25,
-            time_limit=300,
-            threads=0,
-            mip_gap=0.01,
-            lambda_prob=0.05,
-            warm_start_prob=0.85,
-            strong_keep_prob=0.70,
-            soft_keep_prob=0.35,
-            top_k_prob=3,
-            top_k_dist=3,
-            knn_repair_k=4,
-            min_degree=3,
-            tight_extra_k=2,
-            mip_focus=1,
-            numeric_focus=1,
-            log_to_console=True,
-        )
-        results.append(result)
-
-    total_time = time.time() - start_all
+    all_instances = discover_instances(args.solver_graph_root, args.instances)
+    if not all_instances:
+        raise FileNotFoundError(f"No instances found under: {args.solver_graph_root}")
 
     summary_rows = []
-    solved = 0
 
-    for r in results:
-        ok = r.get("found", False)
-        solved += int(ok)
-        status_str = "OPTIMAL" if r.get("status") == GRB.OPTIMAL else (
-            "TIME_LIMIT" if r.get("status") == GRB.TIME_LIMIT else (
-                "INFEASIBLE" if r.get("status") == GRB.INFEASIBLE else (
-                    "SUBOPTIMAL" if r.get("status") == GRB.SUBOPTIMAL else "FAIL"
-                )
+    # Prepare real-time display
+    job_progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+    )
+    total_task = job_progress.add_task("[cyan]Overall Progress", total=len(all_instances))
+
+    status_table = Table(title="Live Solver Status", box=box.SIMPLE)
+    status_table.add_column("Instance", style="cyan")
+    status_table.add_column("Current Task", style="yellow")
+    status_table.add_column("Status", justify="center")
+
+    instance_statuses = {} # Name -> Current Task/Status text
+
+    def update_live_table():
+        new_table = Table(title="Live Solver Status", box=box.SIMPLE)
+        new_table.add_column("Instance", style="cyan")
+        new_table.add_column("Current Task", style="yellow")
+        new_table.add_column("Status", justify="center")
+        
+        # Show top 5 recent/active instances to keep it clean
+        displayed = list(instance_statuses.keys())[-10:]
+        for inst in displayed:
+            task_text, status_icon = instance_statuses[inst]
+            new_table.add_row(inst, task_text, status_icon)
+        return new_table
+
+    with Live(Panel(job_progress, title="[bold]VRPTW Solver Dashboard[/bold]", border_style="blue"), console=console, refresh_per_second=4) as live:
+        
+        for inst_name, inst_dir in all_instances:
+            instance_statuses[inst_name] = ("Waiting...", "⏳")
+            
+            # Sub-task update function
+            def make_update_fn(name):
+                def up(msg):
+                    instance_statuses[name] = (msg, "🚀")
+                    live.update(
+                        Panel(
+                            Group(job_progress, update_live_table()),
+                            title="[bold]VRPTW Solver Dashboard[/bold]",
+                            border_style="blue"
+                        )
+                    )
+                return up
+
+            instance_statuses[inst_name] = ("Starting...", "🚀")
+            live.update(Panel(Group(job_progress, update_live_table()), title="[bold]VRPTW Solver Dashboard[/bold]", border_style="blue"))
+            
+            # Clear demarcator for instance start
+            live.console.print("\n")
+            live.console.print(Rule(f"[bold yellow]STARTING INSTANCE: {inst_name}[/bold yellow]", style="yellow", align="left"))
+            
+            # Pre-load metadata for the header
+            try:
+                temp_nodes_path = find_nodes_file(inst_dir)
+                temp_node_data = load_nodes(temp_nodes_path)
+                live.console.print(f"[dim]Directory: {inst_dir}[/dim]")
+                live.console.print(f"[bold cyan]Nodes:[/bold cyan] {len(temp_node_data['node_ids'])} | [bold cyan]Depot:[/bold cyan] {temp_node_data['depot']} | [bold cyan]Capacity:[/bold cyan] {args.capacity}\n")
+            except Exception:
+                live.console.print(f"[dim]Directory: {inst_dir}[/dim]\n")
+
+            result = solve_instance_dynamic(
+                inst_dir=inst_dir,
+                subsets_to_try=args.subsets,
+                capacity=args.capacity,
+                time_limit=args.time_limit,
+                mip_gap=args.mip_gap,
+                max_vehicles=args.max_vehicles,
+                verbose=args.verbose,
+                stop_on_feasible=args.stop_on_feasible,
+                update_fn=make_update_fn(inst_name),
+                output_flag=output_flag
             )
-        )
-        summary_rows.append({
-            "instance": r.get("instance"),
-            "status": status_str,
-            "objective": f"{r.get('objective'):.1f}" if r.get("found") else "N/A",
-            "routes": r.get("num_routes", 0),
-            "gap_%": f"{r.get('gap', 0)*100:.2f}" if r.get("found") else "N/A",
-            "time_s": f"{r.get('time', 0):.2f}",
-            "arcs": r.get("arcs", 0),
-            "solved": "YES" if ok else "NO"
-        })
+
+            success = result.get("success", False)
+            instance_statuses[inst_name] = ("Finished", "✅" if success else "❌")
+            
+            job_progress.advance(total_task)
+            live.update(Panel(Group(job_progress, update_live_table()), title="[bold]VRPTW Solver Dashboard[/bold]", border_style="blue"))
+
+            out_dir = os.path.join(args.output_root, inst_name)
+            ensure_dir(out_dir)
+            write_json(os.path.join(out_dir, "dynamic_result.json"), result)
+
+            final = result.get("final", {}) or {}
+            summary_rows.append({
+                "instance": inst_name,
+                "success": success,
+                "chosen_pct": result.get("chosen_pct"),
+                "final_status": final.get("status"),
+                "objective": final.get("objective"),
+                "runtime_sec": final.get("runtime_sec"),
+                "sol_count": final.get("sol_count"),
+                "num_routes": final.get("num_routes"),
+            })
+
+            # Print per-instance report to the scrolling live log
+            report_table = Table(title=f"Completed: {inst_name}", box=box.ROUNDED, title_justify="left", border_style="green" if success else "red")
+            report_table.add_column("Field", style="bold cyan")
+            report_table.add_column("Details", style="white")
+            
+            report_table.add_row("Final Status", f"[bold]{final.get('status', 'ERROR')}[/bold]")
+            report_table.add_row("Edges Used", f"{result.get('chosen_pct', 'None')}%")
+            report_table.add_row("Objective", f"{final.get('objective', 0.0):.2f}" if final.get("objective") is not None else "N/A")
+            report_table.add_row("Gap Reached", f"{final.get('gap', 0.0)*100:.2f}%" if final.get('gap') is not None else "N/A")
+            report_table.add_row("Vehicles", str(final.get("num_routes", "N/A")))
+            report_table.add_row("Nodes / Edges", f"{final.get('num_nodes', 'N/A')} / {final.get('num_edges', 'N/A')}")
+            report_table.add_row("Solve Time", f"{final.get('runtime_sec', 0.0):.2f}s")
+            
+            live.console.print(Rule(f"[bold green]COMPLETED INSTANCE: {inst_name}[/bold green]", style="green", align="left"))
+            live.console.print(report_table)
+            live.console.print("\n")
 
     summary_df = pd.DataFrame(summary_rows)
-    summary_file = os.path.join(base_path, "solver_summary_safe.csv")
-    summary_df.to_csv(summary_file, index=False)
+    summary_csv = os.path.join(args.output_root, "summary.csv")
+    summary_df.to_csv(summary_csv, index=False)
 
-    print(f"\n{'=' * 80}")
-    print(f"EXECUTION SUMMARY")
-    print(f"{'=' * 80}\n")
-    print(f"Total Instances: {len(instances)}")
-    print(f"Successfully Solved: {solved}/{len(instances)}")
-    print(f"Total Execution Time: {total_time:.1f}s\n")
+    console.print("\n[bold green]Batch Processing Completed.[/bold green]")
+    console.print(f"Full summary saved to: [cyan]{summary_csv}[/cyan]")
 
-    print("RESULTS TABLE:")
-    print(summary_df.to_string(index=False))
-    print(f"\n{'=' * 80}")
-    print(f"Summary saved to: {summary_file}\n")
+    # Final summary table
+    table = Table(title="Optimization Summary", box=box.ROUNDED)
+    table.add_column("Instance", style="cyan")
+    table.add_column("Success", justify="center")
+    table.add_column("Pct (%)", justify="right")
+    table.add_column("Status", style="magenta")
+    table.add_column("Objective", justify="right", style="green")
+    table.add_column("Vehicles", justify="right", style="yellow")
+    table.add_column("Time (s)", justify="right")
+    table.add_column("Sols", justify="right")
+
+    for row in summary_rows:
+        success_str = "[green]Yes[/green]" if row["success"] else "[red]No[/red]"
+        table.add_row(
+            row["instance"],
+            success_str,
+            str(row["chosen_pct"] or "-"),
+            str(row["final_status"] or "-"),
+            f"{row['objective']:.2f}" if row["objective"] is not None else "-",
+            str(row["num_routes"] or "-"),
+            f"{row['runtime_sec']:.2f}" if row["runtime_sec"] is not None else "-",
+            str(row["sol_count"] or 0)
+        )
+    console.print(table)
 
 
 if __name__ == "__main__":
