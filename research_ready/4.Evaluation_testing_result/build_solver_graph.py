@@ -536,8 +536,8 @@ def main() -> None:
     args = parse_args()
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    processed_root = args.processed_root or os.path.join(script_dir, "processed_data")
-    ranked_root = args.ranked_root or os.path.join(script_dir, "ranked_output")
+    processed_root = args.processed_root or os.path.join(script_dir, "Prepared_data")
+    ranked_root = args.ranked_root or os.path.join(script_dir, "Ranked_output")
     output_root = args.output_root or os.path.join(script_dir, "solver_graph")
 
     top_pcts = normalize_top_pcts(args.top_pcts)

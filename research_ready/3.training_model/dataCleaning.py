@@ -3,6 +3,7 @@ import re
 import glob
 import json
 import math
+import time
 import argparse
 from typing import Dict, List, Tuple, Set
 
@@ -13,6 +14,25 @@ try:
     import torch
 except ImportError:
     torch = None
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.progress import (
+        Progress, SpinnerColumn, BarColumn, TextColumn,
+        TimeElapsedColumn, MofNCompleteColumn, TaskProgressColumn,
+    )
+    from rich.live import Live
+    from rich import box
+    from rich.text import Text
+    from rich.columns import Columns
+    from rich.align import Align
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
+console = Console() if RICH_AVAILABLE else None
 
 
 # =============================================================================
@@ -531,12 +551,6 @@ def preprocess_instance(
 ) -> Dict[str, float]:
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"\n{'=' * 88}")
-    print(f"Processing: {data_file}")
-    print(f"Solution  : {solution_file}")
-    print(f"Output    : {output_dir}")
-    print(f"{'=' * 88}")
-
     raw_df = safe_read_table(data_file)
     raw_df = clean_columns(raw_df)
     node_df, stats = prepare_node_dataframe(raw_df)
@@ -546,28 +560,14 @@ def preprocess_instance(
     node_set = set(node_ids)
     N = len(node_ids)
 
-    print(f"  Detected depot_id: {depot_id}")
-    print(f"  First 5 node IDs : {node_ids[:5]}")
-
     routes = parse_solution_routes(solution_file)
-    print(f"  Nodes: {N}, Routes: {len(routes)}")
 
     used_edges, invalid_nodes, self_loops = build_used_edges(routes, depot_id, node_set)
-    if invalid_nodes:
-        print(f"  Warning: invalid route node IDs found: {sorted(invalid_nodes)}")
-    if self_loops:
-        print(f"  Warning: self-loop solution edges ignored: {sorted(self_loops)}")
-
     edge_features_df, edge_index_df, y_label_df, edge_meta = build_edge_data_vectorized(node_df, used_edges)
 
     all_generated_edges = set(zip(edge_index_df["from"], edge_index_df["to"]))
     preserved_edges = used_edges & all_generated_edges
     missing_solution_edges = sorted(list(used_edges - all_generated_edges))
-
-    if missing_solution_edges:
-        print(f"  Warning: missing solution edges detected: {missing_solution_edges}")
-    else:
-        print("  ✓ All solution edges preserved in generated graph")
 
     pos_edges = int(y_label_df["label"].sum())
     total_edges = int(len(y_label_df))
@@ -591,35 +591,29 @@ def preprocess_instance(
         "pos_weight": pos_weight,
         "node_feature_dim": 9,
         "edge_feature_dim": 36,
+        "warnings": [],
     }
 
-    node_out = os.path.join(output_dir, "node_features.csv")
-    edge_index_out = os.path.join(output_dir, "edge_index.csv")
-    edge_feat_out = os.path.join(output_dir, "edge_features.csv")
-    label_out = os.path.join(output_dir, "y_label.csv")
-    stats_out = os.path.join(output_dir, "stats.json")
+    if invalid_nodes:
+        stats_summary["warnings"].append(f"Invalid nodes: {len(invalid_nodes)}")
+    if self_loops:
+        stats_summary["warnings"].append(f"Self-loops: {len(self_loops)}")
+    if missing_solution_edges:
+        stats_summary["warnings"].append(f"Missing edges: {len(missing_solution_edges)}")
 
-    node_df.to_csv(node_out, index=False)
-    edge_index_df.to_csv(edge_index_out, index=False)
-    edge_features_df.to_csv(edge_feat_out, index=False)
-    y_label_df.to_csv(label_out, index=False)
-
-    with open(stats_out, "w", encoding="utf-8") as f:
+    node_df.to_csv(os.path.join(output_dir, "node_features.csv"), index=False)
+    edge_index_df.to_csv(os.path.join(output_dir, "edge_index.csv"), index=False)
+    edge_features_df.to_csv(os.path.join(output_dir, "edge_features.csv"), index=False)
+    y_label_df.to_csv(os.path.join(output_dir, "y_label.csv"), index=False)
+    with open(os.path.join(output_dir, "stats.json"), "w", encoding="utf-8") as f:
         json.dump(stats_summary, f, indent=2)
 
     if save_pt:
         pt_out = os.path.join(output_dir, "graph_data.pt")
         pt_data = build_pt_data(node_df, edge_features_df, y_label_df)
         torch.save(pt_data, pt_out)
-        print(f"  ✓ Saved PyTorch graph data: {pt_out}")
 
-    print(f"  Total edges         : {total_edges:,}")
-    print(f"  Solution edges      : {len(used_edges)}")
-    print(f"  Preserved edges     : {len(preserved_edges)}")
-    print(f"  Positive ratio      : {pos_ratio:.6f}")
-    print(f"  Pos weight          : {pos_weight:.4f}")
-    print(f"  Time-feasible ratio : {edge_meta['time_feasible_ratio']:.6f}")
-    print(f"  ✓ Files saved to {output_dir}")
+    return stats_summary
 
     return stats_summary
 
@@ -636,6 +630,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Rich helpers
+# ---------------------------------------------------------------------------
+def _make_results_table(results: list) -> Table:
+    """Build the per-instance results summary table."""
+    table = Table(
+        box=box.SIMPLE_HEAD,
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+    )
+    table.add_column("Instance", style="bold white", min_width=20)
+    table.add_column("Nodes", justify="right", style="cyan")
+    table.add_column("Routes", justify="right", style="cyan")
+    table.add_column("Edges", justify="right", style="yellow")
+    table.add_column("Pos%", justify="right", style="green")
+    table.add_column("TF%", justify="right", style="blue")
+    table.add_column("Warn", style="yellow")
+
+    for r in results:
+        w_text = f"{len(r['warnings'])}" if r['warnings'] else "—"
+        table.add_row(
+            r["instance"],
+            str(r["nodes"]),
+            str(r["routes"]),
+            f"{r['edges']:,}",
+            f"{r['positive_ratio']*100:.1f}%",
+            f"{r['time_feasible_ratio']*100:.0f}%",
+            w_text,
+        )
+    return table
+
+
 def main() -> None:
     args = parse_args()
 
@@ -643,93 +670,94 @@ def main() -> None:
     input_root = args.input_root or os.path.join(script_dir, "dataset")
     output_root = args.output_root or os.path.join(script_dir, "processed_data")
 
-    save_pt = True
-    if args.no_save_pt:
-        save_pt = False
-    elif args.save_pt:
-        save_pt = True
+    save_pt = not args.no_save_pt
+
+    if RICH_AVAILABLE:
+        console.print(f"\n[bold cyan]Processing VRPTW Dataset[/bold cyan] [dim]({input_root})[/dim]")
+    else:
+        print(f"Processing: {input_root}")
 
     if not os.path.isdir(input_root):
-        print(f"ERROR: Input directory not found at {input_root}")
+        if RICH_AVAILABLE:
+            console.print(f"[bold red]Error:[/bold red] Input directory not found: {input_root}")
+        else:
+            print(f"Error: Input directory not found: {input_root}")
         raise SystemExit(1)
 
+    # ── Discover instances ───────────────────────────────────────────────────
     instance_dirs = sorted(
-        d for d in glob.glob(os.path.join(input_root, "inst_*")) if os.path.isdir(d)
+        d
+        for pattern in [
+            os.path.join(input_root, "inst_*"),
+            os.path.join(input_root, "*", "inst_*"),
+        ]
+        for d in glob.glob(pattern)
+        if os.path.isdir(d)
     )
-
-    print(f"Found {len(instance_dirs)} instance folders.\n")
-    print(f"{'Instance':<15} {'Data File':<15} {'Solution File':<15} {'Status':<20}")
-    print("-" * 75)
 
     valid_pairs = []
     for inst_dir in instance_dirs:
         inst_name = os.path.basename(inst_dir)
+        rel_path = os.path.relpath(inst_dir, input_root)
         data_file = os.path.join(inst_dir, "data.csv")
-        solution_file = os.path.join(inst_dir, "solution.txt")
+        sol_file = os.path.join(inst_dir, "solution.txt")
+        if os.path.exists(data_file) and os.path.exists(sol_file):
+            valid_pairs.append((rel_path, inst_name, data_file, sol_file))
 
-        if os.path.exists(data_file) and os.path.exists(solution_file):
-            print(f"{inst_name:<15} {'data.csv':<15} {'solution.txt':<15} {'✓ Found':<20}")
-            valid_pairs.append((inst_name, data_file, solution_file))
+    if RICH_AVAILABLE:
+        console.print(f"Found [green]{len(valid_pairs)}[/green] valid instances. [dim](skipped {len(instance_dirs) - len(valid_pairs)})[/dim]\n")
+
+    if not valid_pairs:
+        if RICH_AVAILABLE:
+            console.print("[yellow]No valid instances found.[/yellow]")
         else:
-            missing = []
-            if not os.path.exists(data_file):
-                missing.append("data.csv")
-            if not os.path.exists(solution_file):
-                missing.append("solution.txt")
-            print(f"{inst_name:<15} {'data.csv':<15} {'solution.txt':<15} {('Missing: ' + ', '.join(missing)):<20}")
-
-    print("-" * 75)
-    print(f"\nValid instances: {len(valid_pairs)}/{len(instance_dirs)}")
-
-    if len(valid_pairs) == 0:
-        print("No valid instance folders found.")
-        raise SystemExit(1)
-
-    if save_pt and torch is None:
-        print("ERROR: save_pt=True but torch is not installed.")
-        print("Install torch, or run with --no_save_pt.")
-        raise SystemExit(1)
+            print("No valid instances found.")
+        return
 
     os.makedirs(output_root, exist_ok=True)
 
+    # ── Batch processing ────────────────────────────────────────────────────
     results = []
-    for inst_name, data_file, solution_file in valid_pairs:
-        output_dir = os.path.join(output_root, inst_name)
-        result = preprocess_instance(
-            data_file=data_file,
-            solution_file=solution_file,
-            output_dir=output_dir,
-            save_pt=save_pt,
-        )
-        results.append(result)
+    batch_start = time.time()
 
-    print(f"\n{'=' * 126}")
-    print("BATCH PROCESSING COMPLETE")
-    print(f"{'=' * 126}")
-    print(
-        f"{'Instance':<15} {'Nodes':<8} {'Routes':<8} {'Edges':<10} {'Pos':<8} "
-        f"{'Neg':<10} {'PosRatio':<12} {'PosWeight':<12} {'TF_Ratio':<12} {'Missing':<10}"
-    )
-    print("-" * 126)
+    if RICH_AVAILABLE:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("[cyan]Processing...", total=len(valid_pairs))
+            for rel_path, inst_name, data_file, sol_file in valid_pairs:
+                output_dir = os.path.join(output_root, inst_name)
+                result = preprocess_instance(data_file, sol_file, output_dir, save_pt)
+                results.append(result)
+                progress.update(task, advance=1, description=f"[cyan]Last: {inst_name}")
+    else:
+        for rel_path, inst_name, data_file, sol_file in valid_pairs:
+            output_dir = os.path.join(output_root, inst_name)
+            result = preprocess_instance(data_file, sol_file, output_dir, save_pt)
+            results.append(result)
 
-    for r in results:
-        print(
-            f"{r['instance']:<15}"
-            f"{r['nodes']:<8}"
-            f"{r['routes']:<8}"
-            f"{r['edges']:<10}"
-            f"{r['positive_edges']:<8}"
-            f"{r['negative_edges']:<10}"
-            f"{r['positive_ratio']:<12.6f}"
-            f"{r['pos_weight']:<12.4f}"
-            f"{r['time_feasible_ratio']:<12.6f}"
-            f"{r['missing_solution_edges']:<10}"
-        )
+    total_elapsed = time.time() - batch_start
 
-    print("-" * 126)
-    print(f"\nOutput directory structure:")
-    print(f"{output_root}/")
-    show_directory_tree(output_root)
+    # ── Summary ─────────────────────────────────────────────────────────────
+    if RICH_AVAILABLE:
+        console.print(_make_results_table(results))
+        
+        sum_nodes = sum(r["nodes"] for r in results)
+        sum_edges = sum(r["edges"] for r in results)
+        
+        console.print(Panel(
+            f"Processed [bold]{len(results)}[/bold] instances ([cyan]{sum_nodes:,}[/cyan] nodes, [yellow]{sum_edges:,}[/yellow] edges) in [green]{total_elapsed:.1f}s[/green].",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+        ))
+        console.print()
+    else:
+        print(f"Finished {len(results)} instances in {total_elapsed:.1f}s.")
 
 
 if __name__ == "__main__":

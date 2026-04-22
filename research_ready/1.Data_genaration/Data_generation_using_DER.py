@@ -376,35 +376,58 @@ def validate_with_solver(df, series, time_limit=30):
 def generate_batch(
     output_dir='dataset',
     selected_series=None,
-    n_instances_per_series=10,
+    density_counts=None,
     n_customers=100,
-    densities=None,
     seed=42,
     solver_time_limit=30,
 ):
+    """
+    density_counts: dict mapping density (float) -> number of instances to generate.
+    Example: {0.25: 15, 0.50: 20, 0.75: 30, 1.00: 35}
+    """
     np.random.seed(seed)
 
     if selected_series is None:
         selected_series = list(SERIES_PARAMS.keys())
 
-    if densities is None:
-        densities = [0.25, 0.50, 0.75, 1.00]
+    if density_counts is None:
+        density_counts = {0.25: 10, 0.50: 10, 0.75: 10, 1.00: 10}
 
+    densities = sorted(density_counts.keys())
     os.makedirs(output_dir, exist_ok=True)
 
     total_saved = 0
+    total_target = sum(
+        len(selected_series) * density_counts[d] for d in densities
+    )
+
+    # Print the distribution plan
+    print(f"  Density distribution plan:")
+    for d in densities:
+        print(f"    d{int(d*100):3d} → {density_counts[d]:4d} instances per series")
+    print(f"  Grand total target: {total_target} instances")
+    print()
 
     for series in selected_series:
+        # Mirror data/ folder structure: save into a series subfolder
+        series_dir = os.path.join(output_dir, series)
+        os.makedirs(series_dir, exist_ok=True)
+
         for density in densities:
+            n_instances_for_density = density_counts[density]
             density_tag = int(density * 100)
             saved_for_group = 0
             attempts = 0
 
-            while saved_for_group < n_instances_per_series:
+            while saved_for_group < n_instances_for_density:
                 attempts += 1
-                print(f"  Attempt {attempts}: Generating {series} (density={density}) ...", end="\r")
 
-                if attempts > n_instances_per_series * 100:
+                progress_pct = (total_saved / total_target * 100) if total_target > 0 else 0
+                progress_info = f"[{total_saved:04d}/{total_target:04d}] {progress_pct:5.1f}%"
+
+                print(f"  {progress_info} | Attempt {attempts}: Generating {series}/d{density_tag} ...", end="\r")
+
+                if attempts > n_instances_for_density * 100:
                     print(f"\n❌ Too many failed attempts for {series} density={density}")
                     break
 
@@ -415,32 +438,31 @@ def generate_batch(
                 )
 
                 basic_ok = is_feasible(df, series)
-
                 if not basic_ok:
                     continue
 
-                print(f"  Attempt {attempts}: Validating with solver (30s) ...", end="\r")
+                print(f"  {progress_info} | Attempt {attempts}: Validating with solver ({solver_time_limit}s) ...", end="\r")
                 solver_ok = validate_with_solver(
                     df,
                     series=series,
                     time_limit=solver_time_limit,
                 )
-
                 if not solver_ok:
                     continue
 
                 saved_for_group += 1
                 total_saved += 1
-                print(" " * 80, end="\r") # Clear the line
+                print(" " * 100, end="\r")  # Clear the line
 
                 filename = f"{series}_n{n_customers}_d{density_tag}_{saved_for_group:04d}.csv"
-                filepath = os.path.join(output_dir, filename)
+                filepath = os.path.join(series_dir, filename)
 
                 df.to_csv(filepath, index=False)
 
+                new_pct = (total_saved / total_target * 100) if total_target > 0 else 0
                 print(
-                    f"[{total_saved:04d}] Saved {filename} | "
-                    f"Vehicles={df.attrs['n_vehicles']}"
+                    f"  [{total_saved:04d}/{total_target:04d}] {new_pct:5.1f}% | "
+                    f"Saved {series}/{filename} | Vehicles={df.attrs['n_vehicles']}"
                 )
 
     print(f"\nFinished. Total saved instances: {total_saved}")
@@ -451,13 +473,27 @@ def generate_batch(
 # ============================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Dynamic DER-Solomon Generator')
+    parser = argparse.ArgumentParser(
+        description='Dynamic DER-Solomon Generator',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # 100 instances/series, distributed 15/20/30/35 across d25/d50/d75/d100
+  python Data_generation_using_DER.py --n_instances 100
+
+  # Custom total with custom weights
+  python Data_generation_using_DER.py --n_instances 200 --density_weights 10 20 30 40
+
+  # Only R-series, 50 instances/series
+  python Data_generation_using_DER.py --series R1 R2 --n_instances 50
+"""
+    )
 
     parser.add_argument(
         '--output_dir',
         type=str,
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'),
-        help='Folder to save generated instances'
+        help='Root folder to save generated instances (series subfolders created automatically)'
     )
 
     parser.add_argument(
@@ -478,8 +514,17 @@ def parse_args():
     parser.add_argument(
         '--n_instances',
         type=int,
-        default=1,
-        help='Number of instances per series per density'
+        default=10,
+        help='Total instances per series (distributed across densities via --density_weights)'
+    )
+
+    parser.add_argument(
+        '--density_weights',
+        nargs=4,
+        type=float,
+        default=[15.0, 20.0, 30.0, 35.0],
+        metavar=('W_D25', 'W_D50', 'W_D75', 'W_D100'),
+        help='Relative weights for d25/d50/d75/d100 (default: 15 20 30 35)'
     )
 
     parser.add_argument(
@@ -487,13 +532,13 @@ def parse_args():
         nargs='+',
         type=float,
         default=[0.25, 0.50, 0.75, 1.00],
-        help='Density values'
+        help='Density values to generate (must match number of density_weights)'
     )
 
     parser.add_argument(
         '--solver_time',
         type=int,
-        default=30,
+        default=5,
         help='Solver validation time in seconds'
     )
 
@@ -510,13 +555,39 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
 
+    # Build per-density counts from total n_instances + weights
+    densities = args.densities
+    weights   = args.density_weights
+    if len(weights) != len(densities):
+        raise ValueError(
+            f"--density_weights has {len(weights)} values but --densities has {len(densities)}. "
+            "They must match."
+        )
+
+    total_weight = sum(weights)
+    raw_counts   = [args.n_instances * w / total_weight for w in weights]
+
+    # Round while preserving exact total (largest-remainder method)
+    floors  = [int(c) for c in raw_counts]
+    remainders = sorted(
+        range(len(raw_counts)), key=lambda i: -(raw_counts[i] - floors[i])
+    )
+    leftover = args.n_instances - sum(floors)
+    for i in remainders[:leftover]:
+        floors[i] += 1
+
+    density_counts = dict(zip(densities, floors))
+
     print('=' * 60)
     print('DER-Solomon Dynamic Instance Generator')
     print('=' * 60)
     print(f'Series           : {args.series}')
     print(f'Customers        : {args.n_customers}')
-    print(f'Instances/Series : {args.n_instances}')
-    print(f'Densities        : {args.densities}')
+    print(f'Total/Series     : {args.n_instances}')
+    print(f'Density weights  : d25={weights[0]}% | d50={weights[1]}% | d75={weights[2]}% | d100={weights[3]}%')
+    print(f'Per-density counts (per series):')
+    for d, n in density_counts.items():
+        print(f'    d{int(d*100):3d} → {n:4d} instances  ({n/args.n_instances*100:.1f}%)')
     print(f'Solver Time      : {args.solver_time}s')
     print(f'Output Folder    : {args.output_dir}')
     print('=' * 60)
@@ -524,10 +595,8 @@ if __name__ == '__main__':
     generate_batch(
         output_dir=args.output_dir,
         selected_series=args.series,
-        n_instances_per_series=args.n_instances,
+        density_counts=density_counts,
         n_customers=args.n_customers,
-        densities=args.densities,
         seed=args.seed,
         solver_time_limit=args.solver_time,
     )
-

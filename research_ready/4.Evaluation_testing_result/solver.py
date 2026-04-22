@@ -4,6 +4,8 @@ import math
 import time
 import argparse
 from typing import Dict, List, Optional
+from collections import deque
+from datetime import datetime
 
 import pandas as pd
 import gurobipy as gp
@@ -14,11 +16,156 @@ from rich.panel import Panel
 from rich.text import Text
 from rich import box
 from rich.live import Live
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
 from rich.console import Console, Group
 from rich.rule import Rule
+from rich.layout import Layout
+from rich.columns import Columns
 
 console = Console()
+
+
+# ============================================================
+# HUD State Manager
+# ============================================================
+class HUDState:
+    def __init__(self, total_files):
+        self.total_files = total_files
+        self.completed = 0
+        self.pending = total_files
+        self.errors = 0
+        
+        # Current Instance
+        self.inst_name = "Waiting..."
+        self.nodes = 0
+        self.edges = 0
+        self.capacity = 0
+        self.max_veh = 0
+        self.t_limit = 0
+        
+        # Timers
+        self.batch_start_time = time.time()
+        self.inst_start_time = time.time()
+        
+        # Current Progress
+        self.phase_name = "Idle"
+        self.phase_pct = 0.0
+        
+        # History
+        self.history = []
+        
+        # Event Log
+        self.event_log = deque(maxlen=10)
+        self.event_log.append("Solver Dashboard Initialized")
+
+    def log(self, message: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.event_log.append(f"[{timestamp}] {message}")
+
+    def make_layout(self) -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="top", size=9),
+            Layout(name="bottom", ratio=1),
+        )
+        layout["top"].split_row(
+            Layout(name="constraints", ratio=1),
+            Layout(name="overall", ratio=1),
+        )
+        layout["bottom"].split_row(
+            Layout(name="event_log", ratio=1),
+            Layout(name="history", ratio=2),  # Give more room to the table
+        )
+        return layout
+
+    def get_constraints_panel(self) -> Panel:
+        grid = Table.grid(expand=True)
+        grid.add_column(style="cyan", justify="left")
+        grid.add_column(style="white", justify="right")
+        
+        grid.add_row("Capacity:", f"{self.capacity}")
+        grid.add_row("Max Vehicles:", f"{self.max_veh}")
+        grid.add_row("Time Limit:", f"{self.t_limit}s")
+        grid.add_row(Rule(style="dim"))
+        grid.add_row("Cur Instance:", f"[bold yellow]{self.inst_name}[/bold yellow]")
+        grid.add_row("Nodes:", str(self.nodes))
+        grid.add_row("Edges:", str(self.edges))
+        
+        return Panel(grid, title="[bold blue]Solver Constraints & Instance[/bold blue]", border_style="blue")
+
+    def get_overall_status_panel(self) -> Panel:
+        batch_elapsed = time.time() - self.batch_start_time
+        overall_pct = (self.completed / self.total_files) * 100 if self.total_files > 0 else 0
+        
+        grid = Table.grid(expand=True)
+        grid.add_column(style="green")
+        grid.add_column(style="white", justify="right")
+        
+        grid.add_row("Overall Progress:", f"{self.completed} / {self.total_files} ({overall_pct:.1f}%)")
+        grid.add_row("Errors:", f"[red]{self.errors}[/red]")
+        grid.add_row("Total Timer:", f"[bold white]{batch_elapsed:.1f}s[/bold white]")
+        
+        progress_bar = Progress(BarColumn(bar_width=None), TextColumn("[bold]{task.percentage:>3.0f}%"), console=console)
+        p_task = progress_bar.add_task("overall", total=100, completed=overall_pct)
+        
+        content = Group(
+            grid,
+            Rule(style="dim"),
+            progress_bar
+        )
+        return Panel(content, title="[bold green]Overall Progress[/bold green]", border_style="green")
+
+    def get_event_log_panel(self) -> Panel:
+        inst_elapsed = time.time() - self.inst_start_time
+        
+        progress_bar = Progress(BarColumn(bar_width=None), TextColumn("[bold]{task.percentage:>3.0f}%"), console=console)
+        p_task = progress_bar.add_task("phase", total=100, completed=self.phase_pct)
+        
+        grid = Table.grid(expand=True)
+        grid.add_row(f"[bold cyan]Status:[/bold cyan] {self.phase_name}")
+        grid.add_row(f"[bold cyan]Timer:[/bold cyan]  [white]{inst_elapsed:.1f}s[/white]")
+        
+        log_content = "\n".join(self.event_log)
+        
+        content = Group(
+            grid,
+            Rule(style="dim"),
+            progress_bar,
+            Rule(title="Recent Events", style="dim"),
+            Text(log_content, style="dim white")
+        )
+        return Panel(content, title="[bold cyan]Event Log & Current Info[/bold cyan]", border_style="cyan")
+
+    def build_history_table(self, items):
+        table = Table(box=box.SIMPLE, expand=True, show_header=True, header_style="bold magenta")
+        table.add_column("Instance", style="white")
+        table.add_column("Dist", justify="right", style="green")
+        table.add_column("Veh", justify="right", style="yellow")
+        table.add_column("Gap", justify="right", style="blue")
+        table.add_column("Time", justify="right", style="dim")
+        
+        for r in items:
+            table.add_row(
+                r["instance"],
+                f"{r['objective']:.1f}" if r['objective'] else "-",
+                str(r["routes"]) if r["routes"] else "-",
+                f"{r['gap']*100:.1f}%" if r['gap'] else "-",
+                f"{r['runtime']:.1f}s" if r['runtime'] else "-"
+            )
+        return table
+
+    def get_history_panel(self) -> Panel:
+        # Show last 15 rows in live view to fill the panel better
+        table = self.build_history_table(self.history[-15:])
+        return Panel(table, title="[bold magenta]Completed Instances[/bold magenta]", border_style="magenta")
+
+    def render(self) -> Layout:
+        l = self.make_layout()
+        l["constraints"].update(self.get_constraints_panel())
+        l["overall"].update(self.get_overall_status_panel())
+        l["event_log"].update(self.get_event_log_panel())
+        l["history"].update(self.get_history_panel())
+        return l
 
 
 # ============================================================
@@ -410,6 +557,7 @@ def solve_instance_dynamic(
     stop_on_feasible: bool = True,
     update_fn=None,
     output_flag: int = 0,
+    state=None,
 ):
     history = []
 
@@ -417,15 +565,17 @@ def solve_instance_dynamic(
         t0 = time.time()
         
         if update_fn:
-            update_fn(f"Testing [bold cyan]{pct}%[/bold cyan] edge subset...")
+            update_fn(f"Sub {pct}%...", 0)
 
         try:
             data = load_instance(inst_dir=inst_dir, pct=pct, capacity=capacity)
+            if state:
+                state.nodes = len(data["node_ids"])
+                state.edges = len(data["arcs"])
+
             ok, msg = quick_precheck(data, max_vehicles=max_vehicles)
 
             if not ok:
-                if update_fn:
-                    update_fn(f"[yellow]Skipped {pct}% (Precheck)[/yellow]")
                 history.append({
                     "pct": pct,
                     "status": "SKIPPED_PRECHECK",
@@ -445,18 +595,16 @@ def solve_instance_dynamic(
             
             def gurobi_callback(model, where):
                 if where == GRB.Callback.MIP:
+                    runtime = model.cbGet(GRB.Callback.RUNTIME)
+                    pct_done = (runtime / time_limit) * 100 if time_limit > 0 else 0
+                    
                     objbst = model.cbGet(GRB.Callback.MIP_OBJBST)
-                    objbnd = model.cbGet(GRB.Callback.MIP_OBJBND)
-                    
-                    gap = 0.0
-                    if abs(objbst) > 1e-10:
-                        gap = abs(objbst - objbnd) / abs(objbst)
-                    
                     if update_fn and objbst < 1e30:
-                        update_fn(f"Optimizing [bold cyan]{pct}%[/bold cyan] (Gap: [bold yellow]{gap*100:.2f}%[/bold yellow], Obj: [bold green]{objbst:.2f}[/bold green])")
-
-            if update_fn:
-                update_fn(f"Optimizing [bold cyan]{pct}%[/bold cyan]...")
+                        objbnd = model.cbGet(GRB.Callback.MIP_OBJBND)
+                        gap = abs(objbst - objbnd) / max(abs(objbst), 1e-10)
+                        update_fn(f"Sub {pct}% (Gap:{gap*100:.1f}%, Obj:{objbst:.1f})", pct_done)
+                    elif update_fn:
+                        update_fn(f"Sub {pct}% (Searching...)", pct_done)
 
             model.optimize(gurobi_callback)
 
@@ -464,10 +612,6 @@ def solve_instance_dynamic(
                 GRB.OPTIMAL: "OPTIMAL",
                 GRB.INFEASIBLE: "INFEASIBLE",
                 GRB.TIME_LIMIT: "TIME_LIMIT",
-                GRB.SUBOPTIMAL: "SUBOPTIMAL",
-                GRB.INF_OR_UNBD: "INF_OR_UNBD",
-                GRB.UNBOUNDED: "UNBOUNDED",
-                GRB.INTERRUPTED: "INTERRUPTED",
             }
             status_name = status_map.get(model.Status, str(model.Status))
 
@@ -476,8 +620,6 @@ def solve_instance_dynamic(
                 "status": status_name,
                 "runtime_sec": round(time.time() - t0, 4),
                 "sol_count": int(model.SolCount),
-                "nodes_file": data["nodes_path"],
-                "edges_file": data["edges_path"],
                 "num_nodes": len(data["node_ids"]),
                 "num_edges": len(data["arcs"]),
                 "gap": model.MIPGap if model.SolCount > 0 else None,
@@ -488,16 +630,10 @@ def solve_instance_dynamic(
                 sol = extract_solution(model, x, data)
                 rec["solution"] = sol
                 rec["num_routes"] = sol["num_routes"] if sol else 0
+                history.append(rec)
+                return {"success": True, "chosen_pct": pct, "history": history, "final": rec}
 
             history.append(rec)
-
-            if stop_on_feasible and model.SolCount > 0:
-                return {
-                    "success": True,
-                    "chosen_pct": pct,
-                    "history": history,
-                    "final": rec,
-                }
 
         except Exception as e:
             history.append({
@@ -507,39 +643,11 @@ def solve_instance_dynamic(
                 "runtime_sec": round(time.time() - t0, 4),
             })
 
-    if verbose and history:
-        table = Table(title=f"Subset attempts for {os.path.basename(inst_dir)}", box=box.SIMPLE_HEAD)
-        table.add_column("Pct", justify="right")
-        table.add_column("Status")
-        table.add_column("Time (s)", justify="right")
-        table.add_column("Sols", justify="right")
-        table.add_column("Vehicles", justify="right", style="yellow")
-        table.add_column("Objective", justify="right")
-
-        for h in history:
-            color = "green" if h.get("sol_count", 0) > 0 else "red"
-            status = h.get("status", "UNKNOWN")
-            if status == "SKIPPED_PRECHECK":
-                color = "yellow"
-            
-            table.add_row(
-                str(h["pct"]),
-                f"[{color}]{status}[/{color}]",
-                f"{h['runtime_sec']:.2f}",
-                str(h.get("sol_count", 0)),
-                str(h.get("num_routes", "-")),
-                f"{h.get('objective', 0.0):.2f}" if "objective" in h else "-"
-            )
-        console.print(table)
-
-    last = history[-1] if history else None
-    success = any(h.get("sol_count", 0) > 0 for h in history)
-
     return {
-        "success": success,
+        "success": any(h.get("sol_count", 0) > 0 for h in history),
         "chosen_pct": next((h["pct"] for h in history if h.get("sol_count", 0) > 0), None),
         "history": history,
-        "final": last,
+        "final": history[-1] if history else None,
     }
 
 
@@ -553,14 +661,14 @@ def main():
     parser.add_argument("--solver_graph_root", type=str, default=os.path.join(script_dir, "solver_graph"))
     parser.add_argument("--output_root", type=str, default=os.path.join(script_dir, "solver_output"))
     parser.add_argument("--capacity", type=float, default=200.0)
-    parser.add_argument("--time_limit", type=int, default=300)
+    parser.add_argument("--time_limit", type=int, default=5)
     parser.add_argument("--mip_gap", type=float, default=0.01)
     parser.add_argument("--max_vehicles", type=int, default=30)
     parser.add_argument("--subsets", type=int, nargs="+", default=[15, 20, 25, 30, 40, 50])
     parser.add_argument("--instances", nargs="*", default=None)
-    parser.add_argument("--stop_on_feasible", action="store_true")
+    parser.add_argument("--stop_on_feasible", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--gurobi_verbose", action="store_true", help="Enable verbose Gurobi output")
+    parser.add_argument("--gurobi_verbose", action="store_true")
     args = parser.parse_args()
 
     output_flag = 1 if args.gurobi_verbose else 0
@@ -568,73 +676,40 @@ def main():
 
     all_instances = discover_instances(args.solver_graph_root, args.instances)
     if not all_instances:
-        raise FileNotFoundError(f"No instances found under: {args.solver_graph_root}")
+        console.print(f"[bold red]Error:[/bold red] No instances found in {args.solver_graph_root}")
+        return
 
-    summary_rows = []
+    # ── Init HUD State ──────────────────────────────────────────────────────
+    state = HUDState(total_files=len(all_instances))
+    state.t_limit = args.time_limit
+    state.capacity = args.capacity
+    state.max_veh = args.max_vehicles
 
-    # Prepare real-time display
-    job_progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeElapsedColumn(),
-    )
-    total_task = job_progress.add_task("[cyan]Overall Progress", total=len(all_instances))
-
-    status_table = Table(title="Live Solver Status", box=box.SIMPLE)
-    status_table.add_column("Instance", style="cyan")
-    status_table.add_column("Current Task", style="yellow")
-    status_table.add_column("Status", justify="center")
-
-    instance_statuses = {} # Name -> Current Task/Status text
-
-    def update_live_table():
-        new_table = Table(title="Live Solver Status", box=box.SIMPLE)
-        new_table.add_column("Instance", style="cyan")
-        new_table.add_column("Current Task", style="yellow")
-        new_table.add_column("Status", justify="center")
-        
-        # Show top 5 recent/active instances to keep it clean
-        displayed = list(instance_statuses.keys())[-10:]
-        for inst in displayed:
-            task_text, status_icon = instance_statuses[inst]
-            new_table.add_row(inst, task_text, status_icon)
-        return new_table
-
-    with Live(Panel(job_progress, title="[bold]VRPTW Solver Dashboard[/bold]", border_style="blue"), console=console, refresh_per_second=4) as live:
-        
+    # ── Live Execution ──────────────────────────────────────────────────────
+    with Live(state.render(), console=console, refresh_per_second=4, screen=False) as live:
         for inst_name, inst_dir in all_instances:
-            instance_statuses[inst_name] = ("Waiting...", "⏳")
+            # Update Current Instance Info
+            state.inst_name = inst_name
+            state.inst_start_time = time.time()
+            state.phase_name = "Loading..."
+            state.phase_pct = 0
             
-            # Sub-task update function
-            def make_update_fn(name):
-                def up(msg):
-                    instance_statuses[name] = (msg, "🚀")
-                    live.update(
-                        Panel(
-                            Group(job_progress, update_live_table()),
-                            title="[bold]VRPTW Solver Dashboard[/bold]",
-                            border_style="blue"
-                        )
-                    )
-                return up
-
-            instance_statuses[inst_name] = ("Starting...", "🚀")
-            live.update(Panel(Group(job_progress, update_live_table()), title="[bold]VRPTW Solver Dashboard[/bold]", border_style="blue"))
-            
-            # Clear demarcator for instance start
-            live.console.print("\n")
-            live.console.print(Rule(f"[bold yellow]STARTING INSTANCE: {inst_name}[/bold yellow]", style="yellow", align="left"))
-            
-            # Pre-load metadata for the header
             try:
                 temp_nodes_path = find_nodes_file(inst_dir)
                 temp_node_data = load_nodes(temp_nodes_path)
-                live.console.print(f"[dim]Directory: {inst_dir}[/dim]")
-                live.console.print(f"[bold cyan]Nodes:[/bold cyan] {len(temp_node_data['node_ids'])} | [bold cyan]Depot:[/bold cyan] {temp_node_data['depot']} | [bold cyan]Capacity:[/bold cyan] {args.capacity}\n")
+                state.nodes = len(temp_node_data['node_ids'])
             except Exception:
-                live.console.print(f"[dim]Directory: {inst_dir}[/dim]\n")
+                state.nodes = 0
+            
+            live.update(state.render())
+
+            def update_fn(msg, pct):
+                # Only log significant phase changes or "Searching..." starts
+                if state.phase_name != msg and ("Sub" in msg and "Gap" not in msg):
+                    state.log(f"{inst_name}: {msg}")
+                state.phase_name = msg
+                state.phase_pct = pct
+                live.update(state.render())
 
             result = solve_instance_dynamic(
                 inst_dir=inst_dir,
@@ -645,80 +720,57 @@ def main():
                 max_vehicles=args.max_vehicles,
                 verbose=args.verbose,
                 stop_on_feasible=args.stop_on_feasible,
-                update_fn=make_update_fn(inst_name),
-                output_flag=output_flag
+                update_fn=update_fn,
+                output_flag=output_flag,
+                state=state
             )
 
             success = result.get("success", False)
-            instance_statuses[inst_name] = ("Finished", "✅" if success else "❌")
-            
-            job_progress.advance(total_task)
-            live.update(Panel(Group(job_progress, update_live_table()), title="[bold]VRPTW Solver Dashboard[/bold]", border_style="blue"))
+            if not success:
+                state.errors += 1
+                state.log(f"[red]Failed:[/red] {inst_name}")
+            else:
+                state.completed += 1
+                final = result.get("final", {}) or {}
+                obj = final.get("objective", 0)
+                state.log(f"[green]Solved:[/green] {inst_name} (Obj: {obj:.1f})")
 
+            state.pending -= 1
+            
+            # Save artifacts
             out_dir = os.path.join(args.output_root, inst_name)
             ensure_dir(out_dir)
             write_json(os.path.join(out_dir, "dynamic_result.json"), result)
 
             final = result.get("final", {}) or {}
-            summary_rows.append({
+            history_entry = {
                 "instance": inst_name,
                 "success": success,
                 "chosen_pct": result.get("chosen_pct"),
-                "final_status": final.get("status"),
+                "status": final.get("status"),
                 "objective": final.get("objective"),
-                "runtime_sec": final.get("runtime_sec"),
-                "sol_count": final.get("sol_count"),
-                "num_routes": final.get("num_routes"),
-            })
-
-            # Print per-instance report to the scrolling live log
-            report_table = Table(title=f"Completed: {inst_name}", box=box.ROUNDED, title_justify="left", border_style="green" if success else "red")
-            report_table.add_column("Field", style="bold cyan")
-            report_table.add_column("Details", style="white")
+                "runtime": final.get("runtime_sec"),
+                "routes": final.get("num_routes"),
+                "gap": final.get("gap"),
+            }
+            state.history.append(history_entry)
             
-            report_table.add_row("Final Status", f"[bold]{final.get('status', 'ERROR')}[/bold]")
-            report_table.add_row("Edges Used", f"{result.get('chosen_pct', 'None')}%")
-            report_table.add_row("Objective", f"{final.get('objective', 0.0):.2f}" if final.get("objective") is not None else "N/A")
-            report_table.add_row("Gap Reached", f"{final.get('gap', 0.0)*100:.2f}%" if final.get('gap') is not None else "N/A")
-            report_table.add_row("Vehicles", str(final.get("num_routes", "N/A")))
-            report_table.add_row("Nodes / Edges", f"{final.get('num_nodes', 'N/A')} / {final.get('num_edges', 'N/A')}")
-            report_table.add_row("Solve Time", f"{final.get('runtime_sec', 0.0):.2f}s")
-            
-            live.console.print(Rule(f"[bold green]COMPLETED INSTANCE: {inst_name}[/bold green]", style="green", align="left"))
-            live.console.print(report_table)
-            live.console.print("\n")
+            live.update(state.render())
 
-    summary_df = pd.DataFrame(summary_rows)
+    # ── Final Report ────────────────────────────────────────────────────────
+    summary_df = pd.DataFrame(state.history)
     summary_csv = os.path.join(args.output_root, "summary.csv")
     summary_df.to_csv(summary_csv, index=False)
 
-    console.print("\n[bold green]Batch Processing Completed.[/bold green]")
-    console.print(f"Full summary saved to: [cyan]{summary_csv}[/cyan]")
-
-    # Final summary table
-    table = Table(title="Optimization Summary", box=box.ROUNDED)
-    table.add_column("Instance", style="cyan")
-    table.add_column("Success", justify="center")
-    table.add_column("Pct (%)", justify="right")
-    table.add_column("Status", style="magenta")
-    table.add_column("Objective", justify="right", style="green")
-    table.add_column("Vehicles", justify="right", style="yellow")
-    table.add_column("Time (s)", justify="right")
-    table.add_column("Sols", justify="right")
-
-    for row in summary_rows:
-        success_str = "[green]Yes[/green]" if row["success"] else "[red]No[/red]"
-        table.add_row(
-            row["instance"],
-            success_str,
-            str(row["chosen_pct"] or "-"),
-            str(row["final_status"] or "-"),
-            f"{row['objective']:.2f}" if row["objective"] is not None else "-",
-            str(row["num_routes"] or "-"),
-            f"{row['runtime_sec']:.2f}" if row["runtime_sec"] is not None else "-",
-            str(row["sol_count"] or 0)
-        )
-    console.print(table)
+    console.print(Rule(style="dim"))
+    console.print(state.build_history_table(state.history))
+    console.print(Panel(
+        f"Batch Completed: [bold]{state.completed}/{state.total_files}[/bold] solved.\n"
+        f"Full summary saved to: [cyan]{summary_csv}[/cyan]\n"
+        f"Results saved to: [cyan]{args.output_root}[/cyan]",
+        border_style="bright_blue",
+        title="[bold blue]Final Summary[/bold blue]"
+    ))
 
 
 if __name__ == "__main__":

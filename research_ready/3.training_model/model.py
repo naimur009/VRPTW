@@ -4,7 +4,10 @@ import json
 import math
 import random
 import argparse
-from typing import List, Tuple, Dict, Optional
+import time
+from typing import List, Tuple, Dict, Optional, Callable
+from collections import deque
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -16,6 +19,23 @@ from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GINEConv, BatchNorm
+
+try:
+    from rich.console import Console, Group
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.live import Live
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
+    from rich.rule import Rule
+    from rich import box
+    from rich.text import Text
+    from rich.layout import Layout
+    from rich.columns import Columns
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
+console = Console() if RICH_AVAILABLE else None
 
 
 # ============================================================
@@ -30,6 +50,135 @@ def set_seed(seed: int = 42) -> None:
     if torch.backends.cudnn.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+# ============================================================
+# HUD State Manager (Refined Design)
+# ============================================================
+class TrainingHUD:
+    def __init__(self, total_epochs: int, train_batches: int, val_batches: int, config: dict):
+        self.total_epochs = total_epochs
+        self.train_batches = train_batches
+        self.val_batches = val_batches
+        self.config = config
+        
+        self.current_epoch = 0
+        self.history = []
+        self.best_score = 0.0
+        self.lr = config.get("lr", 0.0)
+        self.patience_left = config.get("patience_max", 0)
+        
+        self.train_progress = 0
+        self.val_progress = 0
+        self.status = "Initializing..."
+        
+        self.event_log = deque(maxlen=4)
+        self.start_time = time.time()
+
+    def log(self, message: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.event_log.append(f"[dim]{ts}[/dim] {message}")
+
+    def make_layout(self) -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="top", size=10),
+            Layout(name="middle", size=22),
+            Layout(name="bottom", size=6),
+        )
+        layout["top"].split_row(
+            Layout(name="params", size=35),
+            Layout(name="current", ratio=1),
+        )
+        return layout
+
+    def get_params_panel(self) -> Panel:
+        grid = Table.grid(expand=True)
+        grid.add_column(style="cyan", justify="left")
+        grid.add_column(style="white", justify="right")
+        
+        grid.add_row("Device:", str(self.config.get("device", "N/A")))
+        grid.add_row("Model Dim:", f"{self.config.get('hidden_dim', 0)}")
+        grid.add_row("Batch Size:", str(self.config.get("batch_size", 0)))
+        grid.add_row("Edge Feats:", str(self.config.get("edge_feats", 0)))
+        grid.add_row(Rule(style="dim"))
+        grid.add_row("Train Graphs:", str(self.config.get("train_graphs", 0)))
+        grid.add_row("Val Graphs:", str(self.config.get("val_graphs", 0)))
+        grid.add_row("Loss Weights:", self.config.get("weights", "N/A"))
+        grid.add_row(Rule(style="dim"))
+        grid.add_row("Best Score:", f"[bold green]{self.best_score:.4f}[/bold green]")
+        grid.add_row("Cur LR:", f"{self.lr:.2e}")
+        
+        return Panel(grid, title="[bold blue]Session Config[/bold blue]", border_style="blue")
+
+    def get_current_panel(self) -> Panel:
+        t_pct = (self.train_progress / self.train_batches * 100) if self.train_batches > 0 else 0
+        v_pct = (self.val_progress / self.val_batches * 100) if self.val_batches > 0 else 0
+        
+        train_bar = Progress(BarColumn(bar_width=None), TextColumn("[bold]{task.percentage:>3.0f}%"), console=console)
+        train_bar.add_task("train", total=100, completed=t_pct)
+        
+        val_bar = Progress(BarColumn(bar_width=None), TextColumn("[bold]{task.percentage:>3.0f}%"), console=console)
+        val_bar.add_task("val", total=100, completed=v_pct)
+
+        grid = Table.grid(expand=True)
+        grid.add_column(ratio=1)
+        grid.add_column(justify="right")
+        
+        grid.add_row(
+            f"[bold cyan]Epoch:[/bold cyan] {self.current_epoch} / {self.total_epochs}",
+            f"[bold yellow]Patience:[/bold yellow] {self.patience_left} / {self.config.get('patience_max', 0)}"
+        )
+        grid.add_row(f"[bold cyan]Status:[/bold cyan] {self.status}")
+        
+        content = Group(
+            grid,
+            Rule(style="dim"),
+            Text(f"Training Progress ({self.train_progress}/{self.train_batches})", style="dim"),
+            train_bar,
+            Text(f"Validation Progress ({self.val_progress}/{self.val_batches})", style="dim"),
+            val_bar
+        )
+        return Panel(content, title="[bold yellow]Execution State[/bold yellow]", border_style="yellow")
+
+    def get_history_panel(self) -> Panel:
+        table = Table(box=box.SIMPLE, expand=True, show_header=True, header_style="bold magenta")
+        table.add_column("Epoch", justify="center")
+        table.add_column("Score", justify="right", style="green")
+        table.add_column("T.Loss", justify="right", style="dim")
+        table.add_column("V.Loss", justify="right", style="dim")
+        table.add_column("V.AP", justify="right")
+        table.add_column("V.R@10", justify="right")
+        table.add_column("V.R@15", justify="right")
+        table.add_column("V.R@20", justify="right")
+        table.add_column("NDCG10", justify="right")
+        
+        # Show last 15
+        for h in self.history[-15:]:
+            table.add_row(
+                f"{h['epoch']:03d}",
+                f"{h['score']:.4f}",
+                f"{h['train_loss']:.4f}",
+                f"{h['val_loss']:.4f}",
+                f"{h['val_ap']:.4f}",
+                f"{h['val_r10']:.4f}",
+                f"{h['val_r15']:.4f}",
+                f"{h['val_r20']:.4f}",
+                f"{h['val_ndcg10']:.4f}"
+            )
+        return Panel(table, title="[bold magenta]Training History[/bold magenta]", border_style="magenta")
+
+    def get_log_panel(self) -> Panel:
+        log_content = "\n".join(self.event_log)
+        return Panel(log_content, title="[dim]Event Log[/dim]", border_style="dim")
+
+    def render(self) -> Layout:
+        l = self.make_layout()
+        l["params"].update(self.get_params_panel())
+        l["current"].update(self.get_current_panel())
+        l["middle"].update(self.get_history_panel())
+        l["bottom"].update(self.get_log_panel())
+        return l
 
 
 # ============================================================
@@ -492,6 +641,7 @@ def run_epoch(
     rank_weight: float = 0.45,
     topk_weight: float = 0.35,
     focal_gamma: float = 1.5,
+    on_batch: Optional[Callable] = None,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -555,6 +705,8 @@ def run_epoch(
         total_rank += float(rank.item())
         total_topk += float(topk.item())
         batch_count += 1
+        if on_batch:
+            on_batch(batch_count)
 
     return {
         "loss": total_loss / max(batch_count, 1),
@@ -645,7 +797,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--focal_gamma", type=float, default=1.5)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -716,100 +868,171 @@ def main() -> None:
 
     history = []
 
-    print("=" * 84)
-    print("REFINED GNN TRAINER FOR VRPTW EDGE RANKING")
-    print("SCRIPT PATH:", os.path.abspath(__file__))
-    print("=" * 84)
-    print(f"Device: {device}")
-    print(f"Train graphs: {len(train_set)} | Val graphs: {len(val_set)}")
-    print(f"Node dim: {node_dim} | Edge dim: {edge_dim}")
-    print(f"Global pos_weight: {global_pos_weight.item():.4f}")
-    print(f"Edge features: {edge_feature_cols}")
+    # ── HUD Setup ────────────────────────────────────────────────────────────
+    hud_config = {
+        "device": device,
+        "hidden_dim": args.hidden_dim,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "train_graphs": len(train_set),
+        "val_graphs": len(val_set),
+        "edge_feats": len(edge_feature_cols),
+        "patience_max": args.patience,
+        "weights": f"R:{args.rank_loss_weight} T:{args.topk_loss_weight} G:{args.focal_gamma}"
+    }
+    hud = TrainingHUD(
+        total_epochs=args.epochs,
+        train_batches=len(train_loader),
+        val_batches=len(val_loader),
+        config=hud_config
+    ) if RICH_AVAILABLE else None
 
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(
-            model=model,
-            loader=train_loader,
-            device=device,
-            global_pos_weight=global_pos_weight,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            rank_weight=args.rank_loss_weight,
-            topk_weight=args.topk_loss_weight,
-            focal_gamma=args.focal_gamma,
-        )
-        val_metrics = run_epoch(
-            model=model,
-            loader=val_loader,
-            device=device,
-            global_pos_weight=global_pos_weight,
-            optimizer=None,
-            scheduler=None,
-            rank_weight=args.rank_loss_weight,
-            topk_weight=args.topk_loss_weight,
-            focal_gamma=args.focal_gamma,
-        )
+    if not RICH_AVAILABLE:
+        print("=" * 84)
+        print("REFINED GNN TRAINER FOR VRPTW EDGE RANKING")
+        print("SCRIPT PATH:", os.path.abspath(__file__))
+        print("=" * 84)
+        print(f"Device: {device}")
+        print(f"Train graphs: {len(train_set)} | Val graphs: {len(val_set)}")
+        print(f"Node dim: {node_dim} | Edge dim: {edge_dim}")
+        print(f"Global pos_weight: {global_pos_weight.item():.4f}")
+        print(f"Edge features: {edge_feature_cols}")
 
-        val_score = (
-            0.30 * val_metrics["ap"] +
-            0.25 * val_metrics["r10"] +
-            0.20 * val_metrics["r15"] +
-            0.10 * val_metrics["p10"] +
-            0.10 * val_metrics["ndcg10"] +
-            0.05 * (1.0 - val_metrics["avg_pos_rank_pct"] / 100.0)
-        )
+    # ── Live Execution ───────────────────────────────────────────────────────
+    live_ctx = Live(hud.render(), console=console, refresh_per_second=4, screen=False) if RICH_AVAILABLE else None
+    if live_ctx: 
+        live_ctx.start()
+        hud.log("Training session started")
 
-        epoch_record = {
-            "epoch": epoch,
-            "lr": float(optimizer.param_groups[0]["lr"]),
-            "train": train_metrics,
-            "val": val_metrics,
-            "val_score": float(val_score),
-        }
-        history.append(epoch_record)
+    try:
+        for epoch in range(1, args.epochs + 1):
+            if hud:
+                hud.current_epoch = epoch
+                hud.status = "Training..."
+                hud.train_progress = 0
+                hud.val_progress = 0
+                hud.lr = optimizer.param_groups[0]["lr"]
+                live_ctx.update(hud.render())
 
-        print(
-            f"Epoch {epoch:03d} | "
-            f"Train Loss {train_metrics['loss']:.4f} | "
-            f"Val Loss {val_metrics['loss']:.4f} | "
-            f"Val AP {val_metrics['ap']:.4f} | "
-            f"Val R@10 {val_metrics['r10']:.4f} | "
-            f"Val R@15 {val_metrics['r15']:.4f} | "
-            f"Val R@20 {val_metrics['r20']:.4f} | "
-            f"Val P@10 {val_metrics['p10']:.4f} | "
-            f"Val NDCG@10 {val_metrics['ndcg10']:.4f} | "
-            f"AvgPosRank% {val_metrics['avg_pos_rank_pct']:.2f} | "
-            f"Score {val_score:.4f} | "
-            f"LR {optimizer.param_groups[0]['lr']:.2e}"
-        )
+            def on_train_batch(count):
+                if hud:
+                    hud.train_progress = count
+                    live_ctx.update(hud.render())
 
-        if val_score > best_score:
-            best_score = float(val_score)
-            best_epoch = epoch
-            patience_left = args.patience
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "node_dim": node_dim,
-                    "edge_dim": edge_dim,
-                    "edge_feature_cols": edge_feature_cols,
-                    "args": vars(args),
-                    "best_score": best_score,
-                    "best_epoch": best_epoch,
-                },
-                best_model_path,
+            train_metrics = run_epoch(
+                model=model,
+                loader=train_loader,
+                device=device,
+                global_pos_weight=global_pos_weight,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                rank_weight=args.rank_loss_weight,
+                topk_weight=args.topk_loss_weight,
+                focal_gamma=args.focal_gamma,
+                on_batch=on_train_batch
             )
-            print(f"  Saved best model -> {best_model_path}")
-        else:
-            patience_left -= 1
-            print(f"  No improvement. Patience left: {patience_left}")
 
-        with open(history_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+            if hud:
+                hud.status = "Validating..."
+                live_ctx.update(hud.render())
 
-        if patience_left <= 0:
-            print("Early stopping triggered.")
-            break
+            def on_val_batch(count):
+                if hud:
+                    hud.val_progress = count
+                    live_ctx.update(hud.render())
+
+            val_metrics = run_epoch(
+                model=model,
+                loader=val_loader,
+                device=device,
+                global_pos_weight=global_pos_weight,
+                optimizer=None,
+                scheduler=None,
+                rank_weight=args.rank_loss_weight,
+                topk_weight=args.topk_loss_weight,
+                focal_gamma=args.focal_gamma,
+                on_batch=on_val_batch
+            )
+
+            val_score = (
+                0.30 * val_metrics["ap"] +
+                0.25 * val_metrics["r10"] +
+                0.20 * val_metrics["r15"] +
+                0.10 * val_metrics["p10"] +
+                0.10 * val_metrics["ndcg10"] +
+                0.05 * (1.0 - val_metrics["avg_pos_rank_pct"] / 100.0)
+            )
+
+            epoch_record = {
+                "epoch": epoch,
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "train": train_metrics,
+                "val": val_metrics,
+                "val_score": float(val_score),
+            }
+            history.append(epoch_record)
+
+            if hud:
+                hud.history.append({
+                    "epoch": epoch,
+                    "score": val_score,
+                    "train_loss": train_metrics["loss"],
+                    "val_loss": val_metrics["loss"],
+                    "val_ap": val_metrics["ap"],
+                    "val_r10": val_metrics["r10"],
+                    "val_r15": val_metrics["r15"],
+                    "val_r20": val_metrics["r20"],
+                    "val_ndcg10": val_metrics["ndcg10"],
+                })
+                hud.status = "Epoch Summary"
+                live_ctx.update(hud.render())
+            else:
+                print(
+                    f"Epoch {epoch:03d} | Train Loss {train_metrics['loss']:.4f} | "
+                    f"Val Loss {val_metrics['loss']:.4f} | Score {val_score:.4f}"
+                )
+
+            if val_score > best_score:
+                best_score = float(val_score)
+                best_epoch = epoch
+                patience_left = args.patience
+                
+                if hud:
+                    hud.best_score = best_score
+                    hud.patience_left = patience_left
+                    hud.log(f"[bold green]Best Score![/bold green] ({best_score:.4f})")
+                
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "node_dim": node_dim,
+                        "edge_dim": edge_dim,
+                        "edge_feature_cols": edge_feature_cols,
+                        "args": vars(args),
+                        "best_score": best_score,
+                        "best_epoch": best_epoch,
+                    },
+                    best_model_path,
+                )
+                if hud: hud.log(f"Model saved to models/")
+            else:
+                patience_left -= 1
+                if hud: 
+                    hud.patience_left = patience_left
+                    hud.log(f"No improvement (Patience: {patience_left})")
+
+            with open(history_path, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+
+            if patience_left <= 0:
+                if hud: hud.log("[red]Early stopping triggered[/red]")
+                break
+
+    finally:
+        if live_ctx:
+            hud.status = "Finished"
+            live_ctx.update(hud.render())
+            live_ctx.stop()
 
     print(f"\nBest validation score: {best_score:.4f} at epoch {best_epoch}")
 
