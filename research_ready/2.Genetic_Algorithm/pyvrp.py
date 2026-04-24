@@ -466,7 +466,27 @@ def solve_vrptw(filepath: str, ph1_time: float, ph2_time: float, dashboard=None)
     
     folder_name = save_output(filepath, final_sol)
     total_time = time.time() - start
-    
+
+    # Remove processed instance from the data folder to prevent reprocessing
+    try:
+        path.unlink()
+        if dashboard:
+            dashboard.add_log(f"[dim]Removed source file:[/dim] [dim cyan]{path.name}[/dim cyan]")
+        # Walk up and remove empty parent directories (e.g. C1/, R2/) up to data/
+        data_root = Path(__file__).parent.absolute() / "data"
+        parent = path.parent
+        while parent != data_root and parent.is_dir():
+            if not any(parent.iterdir()):  # directory is empty
+                parent.rmdir()
+                if dashboard:
+                    dashboard.add_log(f"[dim]Removed empty folder:[/dim] [dim cyan]{parent.name}/[/dim cyan]")
+                parent = parent.parent
+            else:
+                break
+    except Exception as del_err:
+        if dashboard:
+            dashboard.add_log(f"[yellow]Warning: could not delete {path.name}: {del_err}[/yellow]")
+
     if dashboard:
         dashboard.add_result(path.name, final_sol.distance()/10, final_sol.num_routes(), veh_time, dist_time, total_time)
         dashboard.add_log(f"Saved in [bold blue]{folder_name}[/bold blue]")
