@@ -514,7 +514,7 @@ Examples:
     parser.add_argument(
         '--n_instances',
         type=int,
-        default=1,
+        default=250,
         help='Total instances per series (distributed across densities via --density_weights)'
     )
 

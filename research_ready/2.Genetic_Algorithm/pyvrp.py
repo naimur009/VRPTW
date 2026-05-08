@@ -497,8 +497,8 @@ def solve_vrptw(filepath: str, ph1_time: float, ph2_time: float, dashboard=None)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch VRPTW Dashboard Solver")
     parser.add_argument("instance", nargs="?", default=None)
-    parser.add_argument("--phase1-time", type=float, default=10.0)
-    parser.add_argument("--phase2-time", type=float, default=30.0)
+    parser.add_argument("--phase1-time", type=float, default=20.0)
+    parser.add_argument("--phase2-time", type=float, default=150.0)
     args = parser.parse_args()
 
     if not args.instance:
