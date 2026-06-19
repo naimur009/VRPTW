@@ -1,16 +1,36 @@
 # ============================================================
 # VRPTW Project Requirements
 # ============================================================
+# SETUP GUIDE:
+#
+#   1. Create venv:
+#        python3 -m venv .venv
+#        source .venv/bin/activate
+#        pip install --upgrade pip
+#
+#   2. Install PyTorch (choose ONE):
+#
+#      GPU (NVIDIA CUDA):
+#        pip install torch==2.12.1 --extra-index-url https://download.pytorch.org/whl/cu124
+#
+#      CPU (no GPU):
+#        pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
+#
+#   3. Install everything else:
+#        pip install -r requirements.txt
+#
+#   4. Verify:
+#        python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+#        # GPU → True  |  CPU → False
+# ============================================================
 
 # --- Optimization Solvers ---
 gurobipy==13.0.1        # Gurobi optimizer (requires license)
 pyvrp==0.13.3           # VRP solver
-vrplib==2.2.0           # VRP instance reader
 
 # --- Deep Learning ---
-torch==2.12.1
+# torch installed separately — see instructions above
 torch-geometric==2.8.0
-networkx==3.6.1
 
 # --- Data Science ---
 numpy==2.4.6

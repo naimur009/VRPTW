@@ -49,30 +49,48 @@ python research_ready/2.Genetic_Algorithm/pyvrp.py --phase1-time 10 --phase2-tim
 
 ## ⚙️ Installation
 
-1. **Prerequisites**: Python 3.10+, Gurobi license (free academic at gurobi.com).
+### Prerequisites
+- Python 3.10+
+- Gurobi license (free academic at gurobi.com)
 
-2. **Setup**:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
+### Setup — Choose Your Environment
 
-3. **No NVIDIA GPU?** PyPI ships the CUDA version of torch (~530MB). If torch fails to import, reinstall the CPU version:
-   ```bash
-   pip install torch --index-url https://download.pytorch.org/whl/cpu
-   ```
+#### Option A: GPU (NVIDIA CUDA)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install torch==2.12.1 torch-geometric==2.8.0 --extra-index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+```
+
+> The `--extra-index-url` ensures PyTorch is installed with CUDA 12.4 support. PyPI's default torch also ships with CUDA (~530MB).
+
+#### Option B: CPU (no NVIDIA GPU)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
+pip install torch-geometric==2.8.0
+pip install -r requirements.txt
+```
+
+> The `--index-url https://download.pytorch.org/whl/cpu` installs a much smaller CPU-only build of PyTorch.
+
+### Verify Installation
+```python
+import torch
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")   # True on GPU, False on CPU
+print(f"CUDA version: {torch.version.cuda}")
+```
 
 ---
 
 ## 💻 Environment & Hardware Note
 *   **Data Generation & Solvers**: Primarily CPU-bound.
 *   **GNN Training/Inference**: Supports both CPU and GPU. For large-scale training, an NVIDIA GPU is highly recommended for performance.
-*   **Current Setup Check**:
-    ```python
-    import torch
-    print(torch.cuda.is_available())  # Checks for GPU detection
-    ```
 
 ---
 
