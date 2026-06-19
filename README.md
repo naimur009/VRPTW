@@ -47,19 +47,20 @@ python research_ready/2.Genetic_Algorithm/pyvrp.py --phase1-time 10 --phase2-tim
 
 ---
 
-## ⚙️ Installation & Requirements
+## ⚙️ Installation
 
-1. **Prerequisites**: Python 3.10+ and a valid **Gurobi License** (for the exact solver).
+1. **Prerequisites**: Python 3.10+, Gurobi license (free academic at gurobi.com).
+
 2. **Setup**:
    ```bash
-   # CPU-only (recommended)
-   pip install torch --index-url https://download.pytorch.org/whl/cpu
+   python3 -m venv .venv
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
-3. **GPU Support**: The GNN models support CUDA acceleration. To enable, ensure NVIDIA drivers are installed:
+
+3. **No NVIDIA GPU?** PyPI ships the CUDA version of torch (~530MB). If torch fails to import, reinstall the CPU version:
    ```bash
-   pip install torch --index-url https://download.pytorch.org/whl/cu124
-   pip install -r requirements.txt
+   pip install torch --index-url https://download.pytorch.org/whl/cpu
    ```
 
 ---
