@@ -697,6 +697,7 @@ def run_epoch(
     loader: DataLoader,
     device: torch.device,
     global_pos_weight: torch.Tensor,
+    is_time_feasible_idx: int = 27,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     rank_weight: float = 0.45,
@@ -722,6 +723,8 @@ def run_epoch(
     graph_p10 = []
     graph_ndcg10 = []
     graph_pos_rank_pct = []
+    graph_violation = []
+    graph_entropy = []
 
     for batch in loader:
         batch = batch.to(device, non_blocking=use_amp)  # overlaps CPU→GPU with compute
@@ -732,12 +735,13 @@ def run_epoch(
             edge_batch = compute_edge_batch(batch)
 
             if is_train:
-                # Stochastic Edge Dropout (Medium Priority)
                 drop_mask = (torch.rand(logits.size(0), device=logits.device) > 0.05)
-                # Apply mask to edges for loss computation
                 logits = logits[drop_mask]
                 labels = labels[drop_mask]
                 edge_batch = edge_batch[drop_mask]
+                edge_attr_used = batch.edge_attr[drop_mask]
+            else:
+                edge_attr_used = batch.edge_attr
 
             loss, cls, rank, topk = compute_graphwise_loss(
                 logits=logits,
@@ -753,7 +757,7 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)   # required before clip_grad_norm_
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -764,11 +768,13 @@ def run_epoch(
             if scheduler is not None:
                 scheduler.step()
 
-        scores = torch.sigmoid(logits.detach())  # detach: release compute graph before metrics
+        scores = torch.sigmoid(logits.detach())
+        time_feasible = edge_attr_used[:, is_time_feasible_idx]
         for g in edge_batch.unique(sorted=True):
             mask = edge_batch == g
             g_scores = scores[mask]
             g_labels = labels[mask]
+            g_tf = time_feasible[mask]
 
             topk_metrics = evaluate_topk_hit_rates(g_scores, g_labels)
             graph_ap.append(average_precision_like(g_scores, g_labels))
@@ -778,6 +784,14 @@ def run_epoch(
             graph_p10.append(topk_metrics["p10"])
             graph_ndcg10.append(topk_metrics["ndcg10"])
             graph_pos_rank_pct.append(avg_positive_rank_percentile(g_scores, g_labels))
+
+            pred_pos = g_scores > 0.5
+            viol = (1.0 - g_tf[pred_pos]).mean().item() if pred_pos.sum() > 0 else 0.0
+            graph_violation.append(viol)
+
+            eps = 1e-8
+            ent = (-g_scores * torch.log(g_scores + eps) - (1 - g_scores) * torch.log(1 - g_scores + eps)).mean().item()
+            graph_entropy.append(ent)
 
         total_loss += float(loss.item())
         total_cls += float(cls.item())
@@ -799,6 +813,8 @@ def run_epoch(
         "p10": mean_or_zero(graph_p10),
         "ndcg10": mean_or_zero(graph_ndcg10),
         "avg_pos_rank_pct": mean_or_zero(graph_pos_rank_pct),
+        "violation_rate": mean_or_zero(graph_violation),
+        "entropy": mean_or_zero(graph_entropy),
     }
 
 
@@ -869,14 +885,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.12)
     parser.add_argument("--lr", type=float, default=8e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--epochs", type=int, default=150)  # 80 was too short for cosine schedule
+    parser.add_argument("--epochs", type=int, default=300)  
     parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument("--rank_loss_weight", type=float, default=0.45)
     parser.add_argument("--topk_loss_weight", type=float, default=0.35)
     parser.add_argument("--focal_gamma", type=float, default=1.5)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--patience", type=int, default=15)  # 5 caused premature early stopping
+    parser.add_argument("--patience", type=int, default=15)  
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -966,8 +982,12 @@ def main() -> None:
 
     best_model_path = os.path.join(model_dir, "best_edge_ranker_refined.pt")
     history_path = os.path.join(model_dir, "train_history_refined.json")
+    csv_path = os.path.join(model_dir, "training_log.csv")
 
     history = []
+    csv_header_written = False
+
+    is_time_feasible_idx = edge_feature_cols.index("is_time_feasible") if "is_time_feasible" in edge_feature_cols else 27
 
     # ── HUD Setup ────────────────────────────────────────────────────────────
     hud_config = {
@@ -1025,6 +1045,7 @@ def main() -> None:
                 loader=train_loader,
                 device=device,
                 global_pos_weight=global_pos_weight,
+                is_time_feasible_idx=is_time_feasible_idx,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 rank_weight=args.rank_loss_weight,
@@ -1048,6 +1069,7 @@ def main() -> None:
                 loader=val_loader,
                 device=device,
                 global_pos_weight=global_pos_weight,
+                is_time_feasible_idx=is_time_feasible_idx,
                 optimizer=None,
                 scheduler=None,
                 rank_weight=args.rank_loss_weight,
@@ -1127,6 +1149,28 @@ def main() -> None:
 
             with open(history_path, "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
+
+            import csv
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not csv_header_written:
+                    writer.writerow([
+                        "epoch", "lr",
+                        "train_loss", "train_ap", "train_r10",
+                        "train_violation_rate", "train_entropy",
+                        "val_loss", "val_ap", "val_r10",
+                        "val_violation_rate", "val_entropy",
+                        "val_score", "patience_left",
+                    ])
+                    csv_header_written = True
+                writer.writerow([
+                    epoch, f"{optimizer.param_groups[0]['lr']:.6f}",
+                    f"{train_metrics['loss']:.6f}", f"{train_metrics['ap']:.6f}", f"{train_metrics['r10']:.6f}",
+                    f"{train_metrics['violation_rate']:.6f}", f"{train_metrics['entropy']:.6f}",
+                    f"{val_metrics['loss']:.6f}", f"{val_metrics['ap']:.6f}", f"{val_metrics['r10']:.6f}",
+                    f"{val_metrics['violation_rate']:.6f}", f"{val_metrics['entropy']:.6f}",
+                    f"{val_score:.6f}", patience_left,
+                ])
 
             if patience_left <= 0:
                 if hud: hud.log("[red]Early stopping triggered[/red]")
