@@ -15,10 +15,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from torch.amp import autocast, GradScaler
 
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GINEConv, BatchNorm
+from torch_geometric.nn import GINEConv, GraphNorm
 
 try:
     from rich.console import Console, Group
@@ -247,19 +248,34 @@ def make_or_load_split(dataset: VRPEdgeDataset, split_dir: str, val_ratio: float
         if len(train_idx) > 0 and len(val_idx) > 0:
             return train_idx, val_idx
 
-    indices = list(range(len(dataset)))
-    random.shuffle(indices)
+    # True Family-Level Split (zero leakage)
+    train_families = {"R1", "C1", "RC1"}
+    val_families = {"R2", "C2", "RC2"}
+        
+    train_names = []
+    val_names = []
+    
+    for name in all_names:
+        parts = name.split('_')
+        family = parts[1] if len(parts) > 1 else 'UNK'
+        
+        if family in train_families:
+            train_names.append(name)
+        elif family in val_families:
+            val_names.append(name)
+        else:
+            # Fallback
+            if random.random() < 0.8:
+                train_names.append(name)
+            else:
+                val_names.append(name)
 
-    n_val = max(1, int(round(len(indices) * val_ratio)))
-    val_idx = indices[:n_val]
-    train_idx = indices[n_val:]
+    if len(train_names) == 0:
+        train_names = val_names
+        val_names = val_names[:1]
 
-    if len(train_idx) == 0:
-        train_idx = val_idx
-        val_idx = val_idx[:1]
-
-    train_names = [all_names[i] for i in train_idx]
-    val_names = [all_names[i] for i in val_idx]
+    train_idx = [name_to_idx[n] for n in train_names]
+    val_idx = [name_to_idx[n] for n in val_names]
 
     save_split_file(train_names, train_path)
     save_split_file(val_names, val_path)
@@ -322,6 +338,22 @@ class ResidualMLP(nn.Module):
         return self.norm(x + self.net(x))
 
 
+class EdgeUpdate(nn.Module):
+    def __init__(self, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, src: torch.Tensor, dst: torch.Tensor, edge: torch.Tensor) -> torch.Tensor:
+        update = self.mlp(torch.cat([src, dst, edge], dim=-1))
+        return self.norm(edge + update)
+
+
 class EdgeRankGNNRefined(nn.Module):
     def __init__(
         self,
@@ -350,9 +382,16 @@ class EdgeRankGNNRefined(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        self.prior_net = nn.Sequential(
+            nn.Linear(edge_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.ffns = nn.ModuleList()
+        self.edge_updates = nn.ModuleList()
 
         for _ in range(num_layers):
             mlp = nn.Sequential(
@@ -361,15 +400,16 @@ class EdgeRankGNNRefined(nn.Module):
                 nn.Linear(hidden_dim, hidden_dim),
             )
             self.convs.append(GINEConv(mlp, edge_dim=hidden_dim))
-            self.norms.append(BatchNorm(hidden_dim))
+            self.norms.append(GraphNorm(hidden_dim))
             self.ffns.append(ResidualMLP(hidden_dim, dropout))
+            self.edge_updates.append(EdgeUpdate(hidden_dim, dropout))
 
         self.src_gate = nn.Linear(hidden_dim, hidden_dim)
         self.dst_gate = nn.Linear(hidden_dim, hidden_dim)
         self.edge_gate = nn.Linear(hidden_dim, hidden_dim)
 
         self.edge_head = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Linear(hidden_dim * 5, hidden_dim),  # 5 due to pair_diff
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -378,19 +418,32 @@ class EdgeRankGNNRefined(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
-        prior = extract_edge_prior(edge_attr, self.edge_feature_cols)
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        edge_index: torch.Tensor, 
+        edge_attr: torch.Tensor, 
+        batch_idx: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # Additive Learnable Prior
+        hand_prior = extract_edge_prior(edge_attr, self.edge_feature_cols)
+        learned_prior = self.prior_net(edge_attr)
+        prior = hand_prior + learned_prior
+        
         edge_attr_aug = torch.cat([edge_attr, prior], dim=-1)
 
         x = self.node_encoder(x)
         e = self.edge_encoder(edge_attr_aug)
 
-        for conv, norm, ffn in zip(self.convs, self.norms, self.ffns):
+        for conv, norm, ffn, edge_up in zip(self.convs, self.norms, self.ffns, self.edge_updates):
             h = conv(x, edge_index, e)
-            h = norm(h)
-            h = F.relu(h)
-            x = x + h
+            h = norm(h, batch_idx)
+            h = F.gelu(h)        # GELU after GraphNorm ensures active gradients without hard-clamping negatives
+            x = x + h            # residual add before FFN
             x = ffn(x)
+            
+            src, dst = edge_index
+            e = edge_up(x[src], x[dst], e)
 
         src, dst = edge_index
         x_src = x[src]
@@ -398,8 +451,9 @@ class EdgeRankGNNRefined(nn.Module):
 
         gated_interaction = torch.sigmoid(self.src_gate(x_src) + self.dst_gate(x_dst) + self.edge_gate(e))
         pair_mul = gated_interaction * (x_src * x_dst)
+        pair_diff = torch.abs(x_src - x_dst)
 
-        edge_repr = torch.cat([x_src, x_dst, e, pair_mul], dim=-1)
+        edge_repr = torch.cat([x_src, x_dst, pair_mul, pair_diff, e], dim=-1)
         logits = self.edge_head(edge_repr).squeeze(-1)
         return logits
 
@@ -428,7 +482,8 @@ def focal_bce_with_logits(
     pos_weight: torch.Tensor,
     gamma: float = 1.5,
 ) -> torch.Tensor:
-    bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction="none")
+    targets_smooth = targets * 0.95 + 0.025  # Label smoothing: pushes targets from 0/1 towards 0.025/0.975
+    bce = F.binary_cross_entropy_with_logits(logits, targets_smooth, pos_weight=pos_weight, reduction="none")
     probs = torch.sigmoid(logits)
     pt = torch.where(targets > 0.5, probs, 1.0 - probs)
     focal_factor = (1.0 - pt).pow(gamma)
@@ -447,19 +502,24 @@ def pairwise_ranking_loss_single_graph(
     if len(pos_idx) == 0 or len(neg_idx) == 0:
         return torch.tensor(0.0, device=logits.device)
 
-    if len(pos_idx) > max_pos:
-        pos_scores = logits[pos_idx]
-        keep = torch.topk(pos_scores, k=max_pos, largest=False).indices
-        pos_idx = pos_idx[keep]
-
-    if len(neg_idx) > max_neg:
-        neg_scores = logits[neg_idx]
-        keep = torch.topk(neg_scores, k=max_neg, largest=True).indices
-        neg_idx = neg_idx[keep]
+    # Probabilistic pair sampling: instead of full outer product (which is O(N*M)),
+    # we sample specific random pairs to compute the margin.
+    min_len = min(len(pos_idx), len(neg_idx))
+    
+    # Shuffle and slice to get random pairs
+    pos_idx = pos_idx[torch.randperm(len(pos_idx))[:min_len]]
+    
+    # For negatives, we can still use the hardness weights for sampling
+    neg_scores_full = logits[neg_idx]
+    prob = torch.softmax(neg_scores_full / 0.5, dim=0)
+    keep_neg = torch.multinomial(prob, min_len, replacement=False)
+    neg_idx = neg_idx[keep_neg]
 
     pos_scores = logits[pos_idx]
     neg_scores = logits[neg_idx]
-    diff = pos_scores[:, None] - neg_scores[None, :]
+    
+    # Element-wise diff for sampled pairs
+    diff = pos_scores - neg_scores
     return F.softplus(-diff).mean()
 
 
@@ -478,7 +538,8 @@ def topk_recall_surrogate_single_graph(
 
     n = logits.numel()
     k = max(1, math.ceil(n * top_frac))
-    threshold = torch.topk(logits, k=k).values[-1]
+    # .detach() makes the threshold a constant — gradient only flows through pos_logits
+    threshold = torch.topk(logits.detach(), k=k).values[-1]
     pos_logits = logits[pos_idx]
     return F.softplus(-(pos_logits - threshold)).mean()
 
@@ -641,9 +702,11 @@ def run_epoch(
     rank_weight: float = 0.45,
     topk_weight: float = 0.35,
     focal_gamma: float = 1.5,
+    scaler: Optional[GradScaler] = None,
     on_batch: Optional[Callable] = None,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
+    use_amp = scaler is not None and device.type == "cuda"
     model.train() if is_train else model.eval()
 
     total_loss = 0.0
@@ -661,31 +724,47 @@ def run_epoch(
     graph_pos_rank_pct = []
 
     for batch in loader:
-        batch = batch.to(device)
+        batch = batch.to(device, non_blocking=use_amp)  # overlaps CPU→GPU with compute
 
-        logits = model(batch.x, batch.edge_index, batch.edge_attr)
-        labels = batch.y.float()
-        edge_batch = compute_edge_batch(batch)
+        with autocast("cuda", enabled=use_amp):
+            logits = model(batch.x, batch.edge_index, batch.edge_attr, getattr(batch, "batch", None))
+            labels = batch.y.float()
+            edge_batch = compute_edge_batch(batch)
 
-        loss, cls, rank, topk = compute_graphwise_loss(
-            logits=logits,
-            labels=labels,
-            edge_batch=edge_batch,
-            global_pos_weight=global_pos_weight,
-            rank_weight=rank_weight,
-            topk_weight=topk_weight,
-            focal_gamma=focal_gamma,
-        )
+            if is_train:
+                # Stochastic Edge Dropout (Medium Priority)
+                drop_mask = (torch.rand(logits.size(0), device=logits.device) > 0.05)
+                # Apply mask to edges for loss computation
+                logits = logits[drop_mask]
+                labels = labels[drop_mask]
+                edge_batch = edge_batch[drop_mask]
+
+            loss, cls, rank, topk = compute_graphwise_loss(
+                logits=logits,
+                labels=labels,
+                edge_batch=edge_batch,
+                global_pos_weight=global_pos_weight,
+                rank_weight=rank_weight,
+                topk_weight=topk_weight,
+                focal_gamma=focal_gamma,
+            )
 
         if is_train:
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)   # required before clip_grad_norm_
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+                optimizer.step()
             if scheduler is not None:
                 scheduler.step()
 
-        scores = torch.sigmoid(logits)
+        scores = torch.sigmoid(logits.detach())  # detach: release compute graph before metrics
         for g in edge_batch.unique(sorted=True):
             mask = edge_batch == g
             g_scores = scores[mask]
@@ -731,7 +810,7 @@ def rank_edges_for_instance(model: nn.Module, data: Data, device: torch.device, 
     model.eval()
     data = data.to(device)
 
-    logits = model(data.x, data.edge_index, data.edge_attr)
+    logits = model(data.x, data.edge_index, data.edge_attr, getattr(data, "batch", None))
     scores = torch.sigmoid(logits).detach().cpu()
 
     src_idx = data.edge_index[0].detach().cpu()
@@ -790,14 +869,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.12)
     parser.add_argument("--lr", type=float, default=8e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--epochs", type=int, default=150)  # 80 was too short for cosine schedule
     parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument("--rank_loss_weight", type=float, default=0.45)
     parser.add_argument("--topk_loss_weight", type=float, default=0.35)
     parser.add_argument("--focal_gamma", type=float, default=1.5)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=15)  # 5 caused premature early stopping
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -824,8 +903,19 @@ def main() -> None:
     train_set = [dataset[i] for i in train_idx]
     val_set = [dataset[i] for i in val_idx]
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False)
+    _is_cuda = device.type == "cuda"
+    _nw_train = min(4, os.cpu_count() or 1) if _is_cuda else 0
+    _nw_val   = min(2, os.cpu_count() or 1) if _is_cuda else 0
+    train_loader = DataLoader(
+        train_set, batch_size=args.batch_size, shuffle=True,
+        num_workers=_nw_train, pin_memory=_is_cuda,
+        persistent_workers=(_nw_train > 0),
+    )
+    val_loader = DataLoader(
+        val_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=_nw_val, pin_memory=_is_cuda,
+        persistent_workers=(_nw_val > 0),
+    )
 
     sample = dataset[0]
     node_dim = sample.x.size(1)
@@ -840,6 +930,11 @@ def main() -> None:
         num_layers=args.num_layers,
         dropout=args.dropout,
     ).to(device)
+
+    uncompiled_model = model
+    # torch.compile: kernel fusion + operator optimisation (~10-30% speedup, PyTorch 2.x)
+    if hasattr(torch, "compile") and device.type == "cuda" and torch.__version__.startswith(("2", "3")):
+        model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -857,6 +952,12 @@ def main() -> None:
         return max(0.05, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    # CUDA-specific: GradScaler for AMP; benchmark mode finds fastest kernels
+    scaler = GradScaler() if device.type == "cuda" else None
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True  # fastest conv kernel per input shape
+
     global_pos_weight = compute_global_pos_weight(train_set, device)
 
     best_score = -1.0
@@ -929,6 +1030,7 @@ def main() -> None:
                 rank_weight=args.rank_loss_weight,
                 topk_weight=args.topk_loss_weight,
                 focal_gamma=args.focal_gamma,
+                scaler=scaler,
                 on_batch=on_train_batch
             )
 
@@ -992,7 +1094,8 @@ def main() -> None:
                     f"Val Loss {val_metrics['loss']:.4f} | Score {val_score:.4f}"
                 )
 
-            if val_score > best_score:
+            min_delta = 0.002
+            if val_score > best_score + min_delta:
                 best_score = float(val_score)
                 best_epoch = epoch
                 patience_left = args.patience
@@ -1002,9 +1105,10 @@ def main() -> None:
                     hud.patience_left = patience_left
                     hud.log(f"[bold green]Best Score![/bold green] ({best_score:.4f})")
                 
+                save_model = getattr(model, "_orig_mod", model)
                 torch.save(
                     {
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": save_model.state_dict(),
                         "node_dim": node_dim,
                         "edge_dim": edge_dim,
                         "edge_feature_cols": edge_feature_cols,
@@ -1037,7 +1141,9 @@ def main() -> None:
     print(f"\nBest validation score: {best_score:.4f} at epoch {best_epoch}")
 
     checkpoint = torch.load(best_model_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    
+    save_model = getattr(model, "_orig_mod", model)
+    save_model.load_state_dict(checkpoint["model_state_dict"])
 
     export_ranked_subset(model, dataset, train_idx, "train", device, ranked_dir)
     export_ranked_subset(model, dataset, val_idx, "val", device, ranked_dir)
